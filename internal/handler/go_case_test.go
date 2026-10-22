@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/git-pkgs/proxy/internal/database"
 	"github.com/git-pkgs/registries/fetch"
@@ -174,7 +175,7 @@ func seedLegacyUpperGoZip(t *testing.T, proxy *Proxy, upstreamURL, content strin
 		t.Fatal(err)
 	}
 	artifact := testArtifact(content, versionPURL, filename, "application/zip")
-	if err := proxy.updateCacheDB("golang", "github.com/Sirupsen/logrus", packagePURL, upstreamURL, storagePath, artifact, ""); err != nil {
+	if err := proxy.updateCacheDB("golang", "github.com/Sirupsen/logrus", packagePURL, upstreamURL, storagePath, artifact, "", time.Time{}); err != nil {
 		t.Fatal(err)
 	}
 	old, err := proxy.DB.GetArtifact(versionPURL, filename)
@@ -198,7 +199,7 @@ func seedGoZip(t *testing.T, proxy *Proxy, upstreamURL, content string) {
 		t.Fatalf("packagePURLStrings: %v", err)
 	}
 	artifact := testArtifact(content, versionPURL, "logrus@v1.0.6.zip", "application/zip")
-	if err := proxy.updateCacheDB("golang", "github.com/sirupsen/logrus", pkgPURL, upstreamURL, storagePath, artifact, ""); err != nil {
+	if err := proxy.updateCacheDB("golang", "github.com/sirupsen/logrus", pkgPURL, upstreamURL, storagePath, artifact, "", time.Time{}); err != nil {
 		t.Fatalf("seeding cache record: %v", err)
 	}
 }

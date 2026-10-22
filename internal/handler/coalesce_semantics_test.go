@@ -482,8 +482,9 @@ func TestCachedArtifactRecord(t *testing.T) {
 
 	hex := sha256Hex(content)
 	committed := testArtifact(content, versionPURL, filename, "application/gzip")
+	published := time.Date(2024, 3, 5, 10, 11, 12, 0, time.UTC)
 	if err := proxy.updateCacheDB("npm", "pkg", pkgPURL,
-		"https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz", storagePath, committed, ""); err != nil {
+		"https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz", storagePath, committed, "", published); err != nil {
 		t.Fatalf("seeding cache record: %v", err)
 	}
 
@@ -510,6 +511,10 @@ func TestCachedArtifactRecord(t *testing.T) {
 			}
 			if got.artifact.Digest.Encoded() != hex {
 				t.Errorf("digest = %q, want %q", got.artifact.Digest.Encoded(), hex)
+			}
+			// The recheck serves the row it read; its date is that row's.
+			if !got.lastModified.Equal(published) {
+				t.Errorf("lastModified = %v, want %v", got.lastModified, published)
 			}
 		})
 	}
@@ -616,4 +621,80 @@ func TestCoalesce_PanicInSharedFetchDoesNotStrandWaiters(t *testing.T) {
 	if n := inFlightLen(proxy); n != 0 {
 		t.Errorf("in-flight entries after a panic = %d, want 0", n)
 	}
+}
+
+// The upstream date rides with a shared fetch's bytes to every caller: the
+// leader, a caller that joined the fetch, and a leader whose recheck found
+// another fetch's commit.
+func TestCoalesce_LastModifiedReachesEveryCaller(t *testing.T) {
+	const content = "fetched bytes"
+	const storagePath = "maven/g/a/1/a-1.pom"
+	proxy, _, store, _ := setupTestProxy(t)
+	if _, _, err := store.Store(context.Background(), storagePath, strings.NewReader(content)); err != nil {
+		t.Fatalf("Store: %v", err)
+	}
+	published := time.Date(2024, 3, 5, 10, 11, 12, 0, time.UTC)
+	fetched := fetchedArtifact{
+		artifact:     testArtifact(content, "pkg:maven/g/a@1", "a-1.pom", "text/xml"),
+		storagePath:  storagePath,
+		lastModified: published,
+	}
+	noFetch := func(context.Context) (fetchedArtifact, error) {
+		t.Error("fetched although the date's source was there")
+		return fetchedArtifact{}, errors.New("commit must not run")
+	}
+	check := func(name string, res *CacheResult, err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		drain(res)
+		if !res.LastModified.Equal(published) {
+			t.Errorf("%s: LastModified = %v, want %v", name, res.LastModified, published)
+		}
+	}
+
+	// Leader: hold it in commit, take the entry waiters park on, and check
+	// the value it hands them as well as its own result.
+	const key = "pkg:maven/g/a@1\x00a-1.pom"
+	inCommit, release := make(chan struct{}), make(chan struct{})
+	type outcome struct {
+		res *CacheResult
+		err error
+	}
+	leader := make(chan outcome, 1)
+	go func() {
+		res, err := proxy.coalesceFetch(context.Background(), key, missingFromCache,
+			func(context.Context) (fetchedArtifact, error) {
+				close(inCommit)
+				<-release
+				return fetched, nil
+			})
+		leader <- outcome{res, err}
+	}()
+	<-inCommit
+	proxy.fetchMu.Lock()
+	shared := proxy.inFlight[key]
+	proxy.fetchMu.Unlock()
+	close(release)
+	got := <-leader
+	check("leader", got.res, got.err)
+	if !shared.val.lastModified.Equal(published) {
+		t.Errorf("value handed to waiters: lastModified = %v, want %v", shared.val.lastModified, published)
+	}
+
+	// Waiter: join a finished in-flight entry, as a caller that arrived
+	// during the fetch does once it completes.
+	done := &inflightFetch{done: make(chan struct{}), val: fetched}
+	close(done.done)
+	proxy.fetchMu.Lock()
+	proxy.inFlight["joined"] = done
+	proxy.fetchMu.Unlock()
+	res, err := proxy.coalesceFetch(context.Background(), "joined", missingFromCache, noFetch)
+	check("waiter", res, err)
+
+	// Recheck: another fetch committed before this leader took the key.
+	res, err = proxy.coalesceFetch(context.Background(), "recheck",
+		func() (fetchedArtifact, bool) { return fetched, true }, noFetch)
+	check("recheck", res, err)
 }

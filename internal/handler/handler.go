@@ -361,7 +361,10 @@ type CacheResult struct {
 	RedirectURL string
 	Artifact    artifacts.Artifact
 	Cached      bool
-	storagePath string
+	// LastModified is the Last-Modified upstream sent with these bytes, zero
+	// if none was recorded. Only Maven records it (see fetchDated).
+	LastModified time.Time
+	storagePath  string
 	// rangeable is set on a HEAD cache hit, which has no Reader, when the
 	// stored object would open as a seekable reader.
 	rangeable bool
@@ -405,8 +408,8 @@ func (p *Proxy) GetOrFetchArtifact(ctx context.Context, ecosystem, name, version
 			}
 		}
 		return p.streamFromUpstream(ctx, ecosystem, name, version, filename, versionPURL, info.URL, "", "",
-			func(fetchCtx context.Context) (*fetch.Artifact, error) {
-				return p.Fetcher.Fetch(fetchCtx, info.URL)
+			func(fetchCtx context.Context) (*fetch.Artifact, time.Time, error) {
+				return p.fetchDated(fetchCtx, ecosystem, info.URL, nil)
 			})
 	}
 	if cached, err := p.checkCache(ctx, pkgPURL, versionPURL, filename); err != nil {
@@ -558,9 +561,10 @@ func (p *Proxy) readStored(ctx context.Context, pkgPURL, versionPURL, filename s
 	}
 
 	result := &CacheResult{
-		Artifact:    artifact.Artifact,
-		Cached:      true,
-		storagePath: artifact.StoragePath,
+		Artifact:     artifact.Artifact,
+		Cached:       true,
+		LastModified: artifact.LastModified.Time,
+		storagePath:  artifact.StoragePath,
 	}
 
 	if servingHead(ctx) {
@@ -680,7 +684,7 @@ func (p *Proxy) fetchAndCache(ctx context.Context, ecosystem, name, version, fil
 
 	// Fetch from upstream with timing
 	fetchStart := time.Now()
-	artifact, err := p.Fetcher.Fetch(ctx, info.URL)
+	artifact, lastModified, err := p.fetchDated(ctx, ecosystem, info.URL, nil)
 	fetchDuration := time.Since(fetchStart)
 
 	if err != nil {
@@ -694,7 +698,7 @@ func (p *Proxy) fetchAndCache(ctx context.Context, ecosystem, name, version, fil
 	}
 	metrics.RecordUpstreamFetch(ecosystem, fetchDuration)
 
-	return p.storeFetched(ctx, ecosystem, name, version, filename, pkgPURL, versionPURL, info.URL, "", "", artifact)
+	return p.storeFetched(ctx, ecosystem, name, version, filename, pkgPURL, versionPURL, info.URL, "", "", artifact, lastModified)
 }
 
 // storeArtifact writes a fetched artifact to storage, verifies it against
@@ -712,7 +716,7 @@ func (p *Proxy) fetchAndCache(ctx context.Context, ecosystem, name, version, fil
 //
 // It returns the artifact and its storage path, not a reader; callers get one
 // from openStoredArtifact.
-func (p *Proxy) storeArtifact(ctx context.Context, ecosystem, name, version, filename, pkgPURL, versionPURL, upstreamURL, upstreamHash, declared string, artifact *fetch.Artifact) (fetchedArtifact, error) {
+func (p *Proxy) storeArtifact(ctx context.Context, ecosystem, name, version, filename, pkgPURL, versionPURL, upstreamURL, upstreamHash, declared string, artifact *fetch.Artifact, lastModified time.Time) (fetchedArtifact, error) {
 	storagePath := storage.FetchPath(ecosystem, name, version, storage.NewFetchID(), filename)
 
 	body, verified, err := verifyIntegrity(artifact.Body, declared)
@@ -770,7 +774,7 @@ func (p *Proxy) storeArtifact(ctx context.Context, ecosystem, name, version, fil
 	}
 
 	// Update database
-	if err := p.updateCacheDB(ecosystem, name, pkgPURL, upstreamURL, storagePath, sharedArtifact, declared); err != nil {
+	if err := p.updateCacheDB(ecosystem, name, pkgPURL, upstreamURL, storagePath, sharedArtifact, declared, lastModified); err != nil {
 		if errors.Is(err, database.ErrLocalArtifactExists) {
 			p.Logger.Info("artifact was pushed while it was fetched; keeping the pushed copy",
 				"purl", versionPURL, "filename", filename)
@@ -782,7 +786,7 @@ func (p *Proxy) storeArtifact(ctx context.Context, ecosystem, name, version, fil
 		if qErr := p.DB.QueuePendingDelete(storagePath); qErr != nil && !p.recordedAt(versionPURL, filename, storagePath) {
 			p.Logger.Warn("failed to queue unrecorded artifact for deletion, deleting it once served",
 				"path", storagePath, "error", qErr)
-			return fetchedArtifact{artifact: sharedArtifact, storagePath: storagePath}, errUnrecorded
+			return fetchedArtifact{artifact: sharedArtifact, storagePath: storagePath, lastModified: lastModified}, errUnrecorded
 		}
 	} else if mirrorFetch(ctx) {
 		if err := p.DB.MarkArtifactMirrored(versionPURL, filename); err != nil {
@@ -790,7 +794,9 @@ func (p *Proxy) storeArtifact(ctx context.Context, ecosystem, name, version, fil
 		}
 	}
 
-	return fetchedArtifact{artifact: sharedArtifact, storagePath: storagePath}, nil
+	// The date goes with these bytes even if the record was not written, so
+	// a response never carries another fetch's date.
+	return fetchedArtifact{artifact: sharedArtifact, storagePath: storagePath, lastModified: lastModified}, nil
 }
 
 // recordedAt reports whether the artifact's record points at storagePath. A
@@ -874,9 +880,10 @@ func (p *Proxy) openStoredArtifact(ctx context.Context, fetched fetchedArtifact)
 	}
 
 	return &CacheResult{
-		Reader:   reader,
-		Artifact: artifact,
-		Cached:   false,
+		Reader:       reader,
+		Artifact:     artifact,
+		Cached:       false,
+		LastModified: fetched.lastModified,
 	}, nil
 }
 
@@ -902,7 +909,7 @@ func (p *Proxy) cachedArtifactRecord(pkgPURL, versionPURL, filename, upstreamHas
 	if !artifactHashMatches(record.Artifact.Digest.Encoded(), upstreamHash) {
 		return fetchedArtifact{}, false
 	}
-	return fetchedArtifact{artifact: record.Artifact, storagePath: record.StoragePath}, true
+	return fetchedArtifact{artifact: record.Artifact, storagePath: record.StoragePath, lastModified: record.LastModified.Time}, true
 }
 
 // errSharedFetchAbandoned is what waiters see if the caller running a shared
@@ -1230,6 +1237,8 @@ func trySlot(mu *sync.Mutex, slots *chan struct{}, size int) bool {
 type fetchedArtifact struct {
 	artifact    artifacts.Artifact
 	storagePath string
+	// lastModified is the Last-Modified upstream sent with these bytes.
+	lastModified time.Time
 }
 
 // runScan generates a signed fetch URL for the just-staged artifact and
@@ -1269,7 +1278,7 @@ func (p *Proxy) runScan(ctx context.Context, ecosystem, name, version, filename,
 	return nil
 }
 
-func (p *Proxy) updateCacheDB(ecosystem, name, pkgPURL, upstreamURL, storagePath string, artifact artifacts.Artifact, declared string) error {
+func (p *Proxy) updateCacheDB(ecosystem, name, pkgPURL, upstreamURL, storagePath string, artifact artifacts.Artifact, declared string, lastModified time.Time) error {
 	now := time.Now()
 
 	// Upsert package
@@ -1297,6 +1306,9 @@ func (p *Proxy) updateCacheDB(ecosystem, name, pkgPURL, upstreamURL, storagePath
 		Size:        sql.NullInt64{Int64: artifact.Size, Valid: true},
 		ContentType: sql.NullString{String: artifact.MediaType, Valid: true},
 		FetchedAt:   sql.NullTime{Time: now, Valid: true},
+		// Replaced on every fetch, NULL if upstream sent none: the date
+		// belongs to these bytes.
+		LastModified: sql.NullTime{Time: lastModified, Valid: !lastModified.IsZero()},
 	}
 	// One transaction, so a push that landed while this was fetched keeps
 	// both its artifact and its version's integrity.
@@ -1345,6 +1357,12 @@ func serveArtifactResponse(w http.ResponseWriter, method string, request *http.R
 
 	if result.Artifact.MediaType != "" {
 		w.Header().Set(headerContentType, result.Artifact.MediaType)
+	}
+	if lm := result.LastModified; !lm.IsZero() {
+		// Never later than the response (RFC 9110 8.8.2.1): a clock-skewed
+		// upstream date goes out as now. Informational only: artifact
+		// responses never answer 304.
+		w.Header().Set(headerLastModified, minTime(lm, time.Now()).UTC().Format(http.TimeFormat))
 	}
 	if contentHash != "" {
 		w.Header().Set(headerETag, `"`+contentHash+`"`)
@@ -1400,6 +1418,7 @@ func serveArtifactRange(w http.ResponseWriter, request *http.Request, result *Ca
 		w.Header().Del(headerContentType)
 		w.Header().Del(headerContentLength)
 		w.Header().Del(headerETag)
+		w.Header().Del(headerLastModified)
 		w.Header().Del("Accept-Ranges")
 		http.Error(w, "failed to seek cached artifact", http.StatusInternalServerError)
 		return true
@@ -2600,8 +2619,8 @@ func (p *Proxy) getOrFetchArtifactFromURLWithCachePURLs(ctx context.Context, eco
 	}
 	if p.StreamArtifacts {
 		return p.streamFromUpstream(ctx, ecosystem, name, version, filename, versionPURL, downloadURL, upstreamHash, declared,
-			func(fetchCtx context.Context) (*fetch.Artifact, error) {
-				return p.fetchUpstream(fetchCtx, downloadURL, headers)
+			func(fetchCtx context.Context) (*fetch.Artifact, time.Time, error) {
+				return p.fetchDated(fetchCtx, ecosystem, downloadURL, headers)
 			})
 	}
 	if cached, err := p.getCachedArtifactWithUpstreamHash(ctx, pkgPURL, versionPURL, filename, upstreamHash); err != nil {
@@ -2650,7 +2669,7 @@ func (p *Proxy) cacheStoredCopy(ctx context.Context, ecosystem, name, version, f
 		p.Logger.Info("caching a stored copy", "ecosystem", ecosystem, "name", name, "version", version,
 			"source", source.StoragePath)
 		return p.storeArtifact(fetchCtx, ecosystem, name, version, filename, pkgPURL, versionPURL, upstreamURL, upstreamHash, "",
-			&fetch.Artifact{Body: body, Size: source.Size, ContentType: source.ContentType.String})
+			&fetch.Artifact{Body: body, Size: source.Size, ContentType: source.ContentType.String}, time.Time{})
 	})
 }
 
@@ -2736,7 +2755,7 @@ func (p *Proxy) fetchAndCacheFromURL(ctx context.Context, ecosystem, name, versi
 		"ecosystem", ecosystem, "name", name, "version", version, "url", downloadURL)
 
 	fetchStart := time.Now()
-	artifact, err := p.fetchUpstream(ctx, downloadURL, headers)
+	artifact, lastModified, err := p.fetchDated(ctx, ecosystem, downloadURL, headers)
 	metrics.RecordUpstreamFetch(ecosystem, time.Since(fetchStart))
 	if err != nil {
 		metrics.RecordUpstreamError(ecosystem, "fetch_failed", metrics.FailureDetail{
@@ -2747,10 +2766,10 @@ func (p *Proxy) fetchAndCacheFromURL(ctx context.Context, ecosystem, name, versi
 		return fetchedArtifact{}, fmt.Errorf("fetching from upstream: %w", err)
 	}
 
-	return p.storeFetched(ctx, ecosystem, name, version, filename, pkgPURL, versionPURL, downloadURL, upstreamHash, declared, artifact)
+	return p.storeFetched(ctx, ecosystem, name, version, filename, pkgPURL, versionPURL, downloadURL, upstreamHash, declared, artifact, lastModified)
 }
 
-type upstreamLastModifiedKey struct{}
+type upstreamHeadersKey struct{}
 
 // WithUpstreamLastModified returns a context under which an artifact fetched
 // from upstream reports its Last-Modified to fn, so a handler can learn a
@@ -2758,7 +2777,22 @@ type upstreamLastModifiedKey struct{}
 // request of its own. fn is not called for a cache hit, or when the
 // response has no usable Last-Modified.
 func WithUpstreamLastModified(ctx context.Context, fn func(time.Time)) context.Context {
-	return context.WithValue(ctx, upstreamLastModifiedKey{}, fn)
+	return withUpstreamHeaders(ctx, func(h http.Header) {
+		if t, err := http.ParseTime(h.Get(headerLastModified)); err == nil {
+			fn(t)
+		}
+	})
+}
+
+// withUpstreamHeaders returns a context under which an artifact fetched
+// from upstream passes the response headers the fetcher keeps to fn, after
+// any observer ctx already has.
+func withUpstreamHeaders(ctx context.Context, fn func(http.Header)) context.Context {
+	if outer, ok := ctx.Value(upstreamHeadersKey{}).(func(http.Header)); ok {
+		inner := fn
+		fn = func(h http.Header) { outer(h); inner(h) }
+	}
+	return context.WithValue(ctx, upstreamHeadersKey{}, fn)
 }
 
 // observedFetcher is the part of fetch.Fetcher and its circuit breaker that
@@ -2857,9 +2891,9 @@ func (b *exactSizeBody) Read(p []byte) (int, error) {
 }
 
 func (p *Proxy) fetchUpstreamURL(ctx context.Context, downloadURL string, headers http.Header) (*fetch.Artifact, error) {
-	report, _ := ctx.Value(upstreamLastModifiedKey{}).(func(time.Time))
+	observe, _ := ctx.Value(upstreamHeadersKey{}).(func(http.Header))
 	observer, ok := p.Fetcher.(observedFetcher)
-	if report == nil || !ok {
+	if observe == nil || !ok {
 		return p.Fetcher.FetchWithHeaders(ctx, downloadURL, headers)
 	}
 	observed, err := observer.FetchObservedWithHeaders(ctx, downloadURL, headers)
@@ -2867,9 +2901,7 @@ func (p *Proxy) fetchUpstreamURL(ctx context.Context, downloadURL string, header
 		return nil, err
 	}
 	if observed.Observation != nil {
-		if t, err := http.ParseTime(observed.Observation.Headers.Get(headerLastModified)); err == nil {
-			report(t)
-		}
+		observe(observed.Observation.Headers)
 	}
 	return observed.Artifact, nil
 }
@@ -2882,7 +2914,7 @@ func (p *Proxy) fetchUpstreamURL(ctx context.Context, downloadURL string, header
 // unknown so the response goes out chunked: a mismatch only shows at EOF,
 // after the bytes have been sent, and an unterminated chunked response is the
 // only way left to make the client reject them (see serveArtifact).
-func (p *Proxy) streamFromUpstream(ctx context.Context, ecosystem, name, version, filename, versionPURL, upstreamURL, upstreamHash, declared string, fetchArtifact func(context.Context) (*fetch.Artifact, error)) (*CacheResult, error) {
+func (p *Proxy) streamFromUpstream(ctx context.Context, ecosystem, name, version, filename, versionPURL, upstreamURL, upstreamHash, declared string, fetchArtifact func(context.Context) (*fetch.Artifact, time.Time, error)) (*CacheResult, error) {
 	if err := p.upstreamHeld(upstreamURL); err != nil {
 		return nil, err
 	}
@@ -2890,7 +2922,7 @@ func (p *Proxy) streamFromUpstream(ctx context.Context, ecosystem, name, version
 		"ecosystem", ecosystem, "name", name, "version", version, "url", upstreamURL)
 
 	fetchStart := time.Now()
-	artifact, err := fetchArtifact(ctx)
+	artifact, lastModified, err := fetchArtifact(ctx)
 	metrics.RecordUpstreamFetch(ecosystem, time.Since(fetchStart))
 	if err != nil {
 		metrics.RecordUpstreamError(ecosystem, "fetch_failed", metrics.FailureDetail{
@@ -2918,6 +2950,7 @@ func (p *Proxy) streamFromUpstream(ctx context.Context, ecosystem, name, version
 			Filename:  filename,
 			MediaType: artifact.ContentType,
 		},
+		LastModified: lastModified,
 	}
 	if upstreamHash == "" && declared == "" {
 		return result, nil

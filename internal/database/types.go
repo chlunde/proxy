@@ -154,6 +154,8 @@ type Artifact struct {
 	// MirroredAt is when a mirror run last found the artifact cached. It
 	// keeps the artifact from retention but not from LRU eviction.
 	MirroredAt sql.NullTime `db:"mirrored_at" json:"-"`
+	// LastModified is the Last-Modified upstream sent with the stored file.
+	LastModified sql.NullTime `db:"last_modified" json:"last_modified,omitempty"`
 }
 
 func (a *Artifact) sourceOrUpstream() string {
@@ -174,6 +176,8 @@ type CachedArtifact struct {
 	StoragePath string
 	Artifact    artifacts.Artifact
 	Integrity   sql.NullString
+	// LastModified is the Last-Modified upstream sent with the stored file.
+	LastModified sql.NullTime
 }
 
 // MetadataCacheEntry represents a cached metadata blob for offline serving.
