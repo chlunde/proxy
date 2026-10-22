@@ -76,7 +76,8 @@ CREATE TABLE IF NOT EXISTS artifacts (
 	updated_at DATETIME,
 	source TEXT NOT NULL DEFAULT 'upstream',
 	manifest TEXT,
-	mirrored_at DATETIME
+	mirrored_at DATETIME,
+	last_modified DATETIME
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_version_filename ON artifacts(version_purl, filename);
 CREATE INDEX IF NOT EXISTS idx_artifacts_storage_path ON artifacts(storage_path);
@@ -272,7 +273,8 @@ CREATE TABLE IF NOT EXISTS artifacts (
 	updated_at TIMESTAMP,
 	source TEXT NOT NULL DEFAULT 'upstream',
 	manifest TEXT,
-	mirrored_at TIMESTAMP
+	mirrored_at TIMESTAMP,
+	last_modified TIMESTAMP
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_version_filename ON artifacts(version_purl, filename);
 CREATE INDEX IF NOT EXISTS idx_artifacts_storage_path ON artifacts(storage_path);
@@ -427,7 +429,8 @@ CREATE TABLE IF NOT EXISTS artifacts (
 	updated_at DATETIME,
 	source TEXT NOT NULL DEFAULT 'upstream',
 	manifest TEXT,
-	mirrored_at DATETIME
+	mirrored_at DATETIME,
+	last_modified DATETIME
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_version_filename ON artifacts(version_purl, filename);
 CREATE INDEX IF NOT EXISTS idx_artifacts_storage_path ON artifacts(storage_path);
@@ -453,7 +456,8 @@ CREATE TABLE IF NOT EXISTS artifacts (
 	updated_at TIMESTAMP,
 	source TEXT NOT NULL DEFAULT 'upstream',
 	manifest TEXT,
-	mirrored_at TIMESTAMP
+	mirrored_at TIMESTAMP,
+	last_modified TIMESTAMP
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_version_filename ON artifacts(version_purl, filename);
 CREATE INDEX IF NOT EXISTS idx_artifacts_storage_path ON artifacts(storage_path);
@@ -583,6 +587,7 @@ var migrations = []migration{
 	{"024_add_image_manifests", migrateAddImageManifests},
 	{"025_partial_artifacts_last_used_index", migratePartialArtifactsLastUsedIndex},
 	{"026_add_image_tags", migrateAddImageTags},
+	{"027_add_artifact_last_modified", migrateAddArtifactLastModified},
 }
 
 // isTableNotFound returns true if the error indicates a missing table.
@@ -1210,6 +1215,27 @@ func migrateAddArtifactManifest(db *DB) error {
 	}
 	if _, err := db.Exec(`ALTER TABLE artifacts ADD COLUMN manifest TEXT`); err != nil {
 		return fmt.Errorf("adding column manifest to artifacts: %w", err)
+	}
+	return nil
+}
+
+// migrateAddArtifactLastModified records the Last-Modified upstream sent
+// with a cached file, so the proxy can send it on. Existing rows stay NULL
+// and are sent without one, as before.
+func migrateAddArtifactLastModified(db *DB) error {
+	hasCol, err := db.HasColumn("artifacts", "last_modified")
+	if err != nil {
+		return fmt.Errorf("checking column last_modified: %w", err)
+	}
+	if hasCol {
+		return nil
+	}
+	colType := sqliteDatetime
+	if db.dialect == DialectPostgres {
+		colType = postgresTimestamp
+	}
+	if _, err := db.Exec(`ALTER TABLE artifacts ADD COLUMN last_modified ` + colType); err != nil {
+		return fmt.Errorf("adding column last_modified to artifacts: %w", err)
 	}
 	return nil
 }

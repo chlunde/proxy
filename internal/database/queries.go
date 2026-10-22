@@ -321,7 +321,7 @@ func (db *DB) GetArtifact(versionPURL, filename string) (*Artifact, error) {
 	query := db.Rebind(`
 		SELECT id, version_purl, filename, upstream_url, storage_path, content_hash,
 		       size, content_type, fetched_at, hit_count, last_accessed_at,
-		       created_at, updated_at, source
+		       created_at, updated_at, source, last_modified
 		FROM artifacts WHERE version_purl = ? AND filename = ?
 	`)
 	err := db.Get(&a, query, versionPURL, filename)
@@ -339,7 +339,7 @@ func (db *DB) GetCachedArtifact(packagePURL, versionPURL, filename string) (*Cac
 	var row cachedArtifactRow
 	query := db.Rebind(`
 		SELECT packages.ecosystem, artifacts.storage_path, artifacts.content_hash, artifacts.size,
-		       artifacts.content_type, versions.integrity
+		       artifacts.content_type, versions.integrity, artifacts.last_modified
 		FROM artifacts
 		JOIN versions ON versions.purl = artifacts.version_purl
 		JOIN packages ON packages.purl = versions.package_purl
@@ -385,12 +385,13 @@ func (db *DB) FindStoredContent(hash string) (*StoredContent, error) {
 }
 
 type cachedArtifactRow struct {
-	Ecosystem   string         `db:"ecosystem"`
-	StoragePath string         `db:"storage_path"`
-	ContentHash sql.NullString `db:"content_hash"`
-	Size        sql.NullInt64  `db:"size"`
-	ContentType sql.NullString `db:"content_type"`
-	Integrity   sql.NullString `db:"integrity"`
+	Ecosystem    string         `db:"ecosystem"`
+	StoragePath  string         `db:"storage_path"`
+	ContentHash  sql.NullString `db:"content_hash"`
+	Size         sql.NullInt64  `db:"size"`
+	ContentType  sql.NullString `db:"content_type"`
+	Integrity    sql.NullString `db:"integrity"`
+	LastModified sql.NullTime   `db:"last_modified"`
 }
 
 // artifact converts a cached artifact row to a CachedArtifact without
@@ -399,9 +400,10 @@ type cachedArtifactRow struct {
 // miss so the client is served a fresh fetch instead of an error.
 func (row cachedArtifactRow) artifact(versionPURL, filename string) *CachedArtifact {
 	return &CachedArtifact{
-		Ecosystem:   row.Ecosystem,
-		StoragePath: row.StoragePath,
-		Integrity:   row.Integrity,
+		Ecosystem:    row.Ecosystem,
+		StoragePath:  row.StoragePath,
+		Integrity:    row.Integrity,
+		LastModified: row.LastModified,
 		Artifact: artifacts.Artifact{
 			PURL:      versionPURL,
 			Digest:    digest.Digest("sha256:" + row.ContentHash.String),
@@ -455,10 +457,10 @@ const upsertArtifactAttempts = 5
 // would remove it. The write applies only if the record still holds the path
 // read before it, so commits racing on one artifact each queue the path they
 // replaced.
-// inUTC returns t in UTC. Artifacts store fetched_at and last_accessed_at in
-// UTC: lib/pq sends a time with its offset, a Postgres TIMESTAMP column keeps
-// only the wall clock, and lib/pq reads that back as UTC, so anything else
-// comes back shifted by the local offset.
+// inUTC returns t in UTC. Artifacts store fetched_at, last_accessed_at and
+// last_modified in UTC: lib/pq sends a time with its offset, a Postgres
+// TIMESTAMP column keeps only the wall clock, and lib/pq reads that back as
+// UTC, so anything else comes back shifted by the local offset.
 func inUTC(t sql.NullTime) sql.NullTime {
 	if t.Valid {
 		t.Time = t.Time.UTC()
@@ -555,8 +557,8 @@ func (db *DB) upsertArtifactFrom(exec execer, a *Artifact, previous sql.NullStri
 		query = `
 			INSERT INTO artifacts (version_purl, filename, upstream_url, storage_path, content_hash,
 			                       size, content_type, fetched_at, hit_count, last_accessed_at,
-			                       created_at, updated_at, source, manifest)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+			                       created_at, updated_at, source, manifest, last_modified)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 			ON CONFLICT(version_purl, filename) DO UPDATE SET
 				upstream_url = EXCLUDED.upstream_url,
 				storage_path = EXCLUDED.storage_path,
@@ -566,16 +568,17 @@ func (db *DB) upsertArtifactFrom(exec execer, a *Artifact, previous sql.NullStri
 				fetched_at = EXCLUDED.fetched_at,
 				updated_at = EXCLUDED.updated_at,
 				source = EXCLUDED.source,
-				manifest = EXCLUDED.manifest
-			WHERE artifacts.storage_path IS NOT DISTINCT FROM $15
+				manifest = EXCLUDED.manifest,
+				last_modified = EXCLUDED.last_modified
+			WHERE artifacts.storage_path IS NOT DISTINCT FROM $16
 				AND (artifacts.source IS NULL OR artifacts.source <> 'local')
 		`
 	} else {
 		query = `
 			INSERT INTO artifacts (version_purl, filename, upstream_url, storage_path, content_hash,
 			                       size, content_type, fetched_at, hit_count, last_accessed_at,
-			                       created_at, updated_at, source, manifest)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			                       created_at, updated_at, source, manifest, last_modified)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(version_purl, filename) DO UPDATE SET
 				upstream_url = excluded.upstream_url,
 				storage_path = excluded.storage_path,
@@ -585,7 +588,8 @@ func (db *DB) upsertArtifactFrom(exec execer, a *Artifact, previous sql.NullStri
 				fetched_at = excluded.fetched_at,
 				updated_at = excluded.updated_at,
 				source = excluded.source,
-				manifest = excluded.manifest
+				manifest = excluded.manifest,
+				last_modified = excluded.last_modified
 			WHERE artifacts.storage_path IS ?
 				AND (artifacts.source IS NULL OR artifacts.source <> 'local')
 		`
@@ -594,7 +598,7 @@ func (db *DB) upsertArtifactFrom(exec execer, a *Artifact, previous sql.NullStri
 	res, err := exec.Exec(query,
 		a.VersionPURL, a.Filename, a.UpstreamURL, a.StoragePath, a.ContentHash,
 		a.Size, a.ContentType, inUTC(a.FetchedAt), a.HitCount, inUTC(a.LastAccessedAt), now, now,
-		a.sourceOrUpstream(), a.Manifest, previous,
+		a.sourceOrUpstream(), a.Manifest, inUTC(a.LastModified), previous,
 	)
 	if err != nil {
 		return false, fmt.Errorf("upserting artifact: %w", err)
@@ -626,7 +630,7 @@ func (db *DB) MarkArtifactCached(versionPURL, filename, storagePath, contentHash
 	query := db.Rebind(`
 		UPDATE artifacts
 		SET storage_path = ?, content_hash = ?, size = ?, content_type = ?,
-		    fetched_at = ?, updated_at = ?
+		    last_modified = NULL, fetched_at = ?, updated_at = ?
 		WHERE version_purl = ? AND filename = ?
 	`)
 	_, err := db.Exec(query, storagePath, contentHash, size, contentType, now.UTC(), now, versionPURL, filename)
@@ -686,7 +690,7 @@ func (db *DB) ClearArtifactCache(versionPURL, filename, storagePath string) (boo
 	query := db.Rebind(`
 		UPDATE artifacts
 		SET storage_path = NULL, content_hash = NULL, size = NULL,
-		    content_type = NULL, fetched_at = NULL, updated_at = ?
+		    content_type = NULL, last_modified = NULL, fetched_at = NULL, updated_at = ?
 		WHERE version_purl = ? AND filename = ? AND storage_path = ?
 	`)
 	res, err := tx.Exec(query, time.Now(), versionPURL, filename, storagePath)

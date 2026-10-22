@@ -24,6 +24,8 @@ type ApprovedArtifact struct {
 	// Cached is set for an artifact found in the cache. One just fetched
 	// for the request is delivered without the cache's checks; see Open.
 	Cached bool
+	// LastModified is the upstream's Last-Modified for the bytes, if known.
+	LastModified time.Time
 
 	ecosystem string
 	checks    integrityChecks
@@ -47,11 +49,12 @@ func (p *Proxy) findStored(pkgPURL, versionPURL, filename string) (*ApprovedArti
 		return nil, nil
 	}
 	return &ApprovedArtifact{
-		Artifact:    record.Artifact,
-		StoragePath: record.StoragePath,
-		Cached:      true,
-		ecosystem:   record.Ecosystem,
-		checks:      checks,
+		Artifact:     record.Artifact,
+		StoragePath:  record.StoragePath,
+		Cached:       true,
+		LastModified: record.LastModified.Time,
+		ecosystem:    record.Ecosystem,
+		checks:       checks,
 	}, nil
 }
 
@@ -70,7 +73,7 @@ func (p *Proxy) Open(ctx context.Context, a *ApprovedArtifact) (*CacheResult, er
 	if !a.Cached {
 		return p.openFetched(ctx, a)
 	}
-	result := &CacheResult{Artifact: a.Artifact, Cached: true, storagePath: a.StoragePath}
+	result := &CacheResult{Artifact: a.Artifact, Cached: true, LastModified: a.LastModified, storagePath: a.StoragePath}
 
 	if servingHead(ctx) {
 		result.rangeable = readsSeekable(p.Storage)
@@ -133,5 +136,5 @@ func (p *Proxy) openFetched(ctx context.Context, a *ApprovedArtifact) (*CacheRes
 			PURL: a.Artifact.PURL, Filename: a.Artifact.Filename, Path: a.StoragePath, Err: err})
 		return nil, fmt.Errorf("opening cached artifact: %w", err)
 	}
-	return &CacheResult{Reader: reader, Artifact: a.Artifact}, nil
+	return &CacheResult{Reader: reader, Artifact: a.Artifact, LastModified: a.LastModified}, nil
 }
