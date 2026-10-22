@@ -421,8 +421,8 @@ func TestCoalesce_KeyIsReleasedAfterFetch(t *testing.T) {
 
 // missingFromCache is a recheck that always reports a miss, so the shared fetch
 // runs.
-func missingFromCache() (artifacts.Artifact, string, bool) {
-	return artifacts.Artifact{}, "", false
+func missingFromCache() (fetchedArtifact, bool) {
+	return fetchedArtifact{}, false
 }
 
 // TestCoalesce_LeaderRechecksCacheBeforeFetching covers the window between a
@@ -444,10 +444,12 @@ func TestCoalesce_LeaderRechecksCacheBeforeFetching(t *testing.T) {
 	}
 
 	res, err := proxy.coalesceFetch(context.Background(), "any-key",
-		func() (artifacts.Artifact, string, bool) { return committed, storagePath, true },
-		func(context.Context) (artifacts.Artifact, string, error) {
+		func() (fetchedArtifact, bool) {
+			return fetchedArtifact{artifact: committed, storagePath: storagePath}, true
+		},
+		func(context.Context) (fetchedArtifact, error) {
 			t.Error("fetched an artifact that was already in the cache")
-			return artifacts.Artifact{}, "", errors.New("commit must not run")
+			return fetchedArtifact{}, errors.New("commit must not run")
 		})
 	if err != nil {
 		t.Fatalf("coalesceFetch failed: %v", err)
@@ -496,18 +498,18 @@ func TestCachedArtifactRecord(t *testing.T) {
 		{"unknown filename", "pkg-1.0.0.zip", hex, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, path, ok := proxy.cachedArtifactRecord(pkgPURL, versionPURL, tc.filename, tc.hash)
+			got, ok := proxy.cachedArtifactRecord(pkgPURL, versionPURL, tc.filename, tc.hash)
 			if ok != tc.want {
 				t.Fatalf("ok = %v, want %v", ok, tc.want)
 			}
 			if !ok {
 				return
 			}
-			if path != storagePath {
-				t.Errorf("storage path = %q, want %q", path, storagePath)
+			if got.storagePath != storagePath {
+				t.Errorf("storage path = %q, want %q", got.storagePath, storagePath)
 			}
-			if got.Digest.Encoded() != hex {
-				t.Errorf("digest = %q, want %q", got.Digest.Encoded(), hex)
+			if got.artifact.Digest.Encoded() != hex {
+				t.Errorf("digest = %q, want %q", got.artifact.Digest.Encoded(), hex)
 			}
 		})
 	}
@@ -529,13 +531,15 @@ func TestCoalesce_LeaderFetchesWhenRecheckedBytesAreGone(t *testing.T) {
 	// The leader runs commit on its own goroutine, so a plain counter is safe.
 	fetches := 0
 	res, err := proxy.coalesceFetch(context.Background(), "any-key",
-		func() (artifacts.Artifact, string, bool) { return stale, storagePath, true },
-		func(ctx context.Context) (artifacts.Artifact, string, error) {
+		func() (fetchedArtifact, bool) {
+			return fetchedArtifact{artifact: stale, storagePath: storagePath}, true
+		},
+		func(ctx context.Context) (fetchedArtifact, error) {
 			fetches++
 			if _, _, err := store.Store(ctx, storagePath, strings.NewReader(content)); err != nil {
-				return artifacts.Artifact{}, "", err
+				return fetchedArtifact{}, err
 			}
-			return testArtifact(content, stale.PURL, stale.Filename, "application/gzip"), storagePath, nil
+			return fetchedArtifact{artifact: testArtifact(content, stale.PURL, stale.Filename, "application/gzip"), storagePath: storagePath}, nil
 		})
 	if err != nil {
 		t.Fatalf("coalesceFetch failed: %v", err)
@@ -580,7 +584,7 @@ func TestCoalesce_PanicInSharedFetchDoesNotStrandWaiters(t *testing.T) {
 			close(leaderPanicked)
 		}()
 		_, _ = proxy.coalesceFetch(context.Background(), key, missingFromCache,
-			func(context.Context) (artifacts.Artifact, string, error) {
+			func(context.Context) (fetchedArtifact, error) {
 				close(inCommit)
 				<-release
 				panic("upstream fetch exploded")

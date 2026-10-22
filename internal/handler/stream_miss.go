@@ -90,7 +90,7 @@ func (h *missHandoff) handedOver() bool {
 // without one: on a recheck hit, an artifact another instance stored, an
 // error, or an artifact a block-mode scanner has to see first. Waiters and
 // the fetch lease still see the fetch end only once the artifact is stored.
-func (p *Proxy) runSharedFetchStreaming(ctx context.Context, key string, f *inflightFetch, recheck func() (artifacts.Artifact, string, bool), commit func(context.Context) (artifacts.Artifact, string, error)) (*CacheResult, error) {
+func (p *Proxy) runSharedFetchStreaming(ctx context.Context, key string, f *inflightFetch, recheck func() (fetchedArtifact, bool), commit func(context.Context) (fetchedArtifact, error)) (*CacheResult, error) {
 	h := &missHandoff{ready: make(chan struct{})}
 	type outcome struct {
 		res *CacheResult
@@ -137,7 +137,7 @@ func (p *Proxy) runSharedFetchStreaming(ctx context.Context, key string, f *infl
 // storeFetched stores an artifact fetched from upstream. When the caller
 // that started the fetch is waiting for a stream, it is sent the bytes as
 // they are stored; see storeWhileServing.
-func (p *Proxy) storeFetched(ctx context.Context, ecosystem, name, version, filename, pkgPURL, versionPURL, upstreamURL, upstreamHash, declared string, artifact *fetch.Artifact) (artifacts.Artifact, string, error) {
+func (p *Proxy) storeFetched(ctx context.Context, ecosystem, name, version, filename, pkgPURL, versionPURL, upstreamURL, upstreamHash, declared string, artifact *fetch.Artifact) (fetchedArtifact, error) {
 	h := handoffFrom(ctx)
 	if h == nil || p.Scanners.Blocks(ecosystem) {
 		return p.storeArtifact(ctx, ecosystem, name, version, filename, pkgPURL, versionPURL, upstreamURL, upstreamHash, declared, artifact)
@@ -153,12 +153,12 @@ var errNoReaderLeft = errors.New("neither storage nor the client is reading the 
 // once, at the upstream's speed; see missFeed for a client that can't keep up.
 // The client's copy is checked before its last bytes, so a mismatch aborts
 // the response. A storage failure leaves the client's copy running.
-func (p *Proxy) storeWhileServing(ctx context.Context, h *missHandoff, ecosystem, name, version, filename, pkgPURL, versionPURL, upstreamURL, upstreamHash, declared string, artifact *fetch.Artifact) (artifacts.Artifact, string, error) {
+func (p *Proxy) storeWhileServing(ctx context.Context, h *missHandoff, ecosystem, name, version, filename, pkgPURL, versionPURL, upstreamURL, upstreamHash, declared string, artifact *fetch.Artifact) (fetchedArtifact, error) {
 	hash := strings.ToLower(upstreamHash)
 	checks, err := newIntegrityChecks(hash, declared)
 	if err != nil {
 		_ = artifact.Body.Close()
-		return artifacts.Artifact{}, "", err
+		return fetchedArtifact{}, err
 	}
 
 	feed := newMissFeed(clientFeedLimit)
@@ -169,7 +169,7 @@ func (p *Proxy) storeWhileServing(ctx context.Context, h *missHandoff, ecosystem
 				"purl", versionPURL, "filename", filename, "reason", reason)
 		}); err != nil {
 			_ = artifact.Body.Close()
-			return artifacts.Artifact{}, "", err
+			return fetchedArtifact{}, err
 		}
 	}
 	stream := &CacheResult{
@@ -194,9 +194,8 @@ func (p *Proxy) storeWhileServing(ctx context.Context, h *missHandoff, ecosystem
 
 	storeR, storeW := io.Pipe()
 	type stored struct {
-		artifact artifacts.Artifact
-		path     string
-		err      error
+		fetched fetchedArtifact
+		err     error
 	}
 	storeDone := make(chan stored, 1)
 	go func() {
@@ -204,12 +203,12 @@ func (p *Proxy) storeWhileServing(ctx context.Context, h *missHandoff, ecosystem
 		// last byte, while storage may still be finishing the upload and the
 		// database write. Reading the upstream still stops with ctx, which
 		// ends the copy to storage too.
-		a, path, err := p.storeArtifact(context.WithoutCancel(ctx), ecosystem, name, version, filename, pkgPURL, versionPURL, upstreamURL, upstreamHash, declared,
+		fetched, err := p.storeArtifact(context.WithoutCancel(ctx), ecosystem, name, version, filename, pkgPURL, versionPURL, upstreamURL, upstreamHash, declared,
 			&fetch.Artifact{Body: storeR, Size: artifact.Size, ContentType: artifact.ContentType, ETag: artifact.ETag})
 		// storeArtifact closes storeR; this covers a return before it read
 		// anything, so the copy below never blocks on it.
 		_ = storeR.Close()
-		storeDone <- stored{a, path, err}
+		storeDone <- stored{fetched, err}
 	}()
 
 	readErr := copyToBoth(artifact.Body, storeW, feed)
@@ -221,7 +220,7 @@ func (p *Proxy) storeWhileServing(ctx context.Context, h *missHandoff, ecosystem
 	if feed.lagging() {
 		// Opened before returning, so an unrecorded object is still there;
 		// runSharedFetch then gives the client a hold on it.
-		feed.resolve(p.openStoredForFeed(ctx, out.artifact, out.path, out.err))
+		feed.resolve(p.openStoredForFeed(ctx, out.fetched, out.err))
 	}
 	if out.err != nil && readErr == nil && feed.fedFully() {
 		p.Logger.Error("artifact sent to the client but not cached",
@@ -229,17 +228,17 @@ func (p *Proxy) storeWhileServing(ctx context.Context, h *missHandoff, ecosystem
 		metrics.RecordArtifactServedUncached(ecosystem, metrics.FailureDetail{
 			PURL: versionPURL, Filename: filename, URL: upstreamURL, Err: out.err})
 	}
-	return out.artifact, out.path, out.err
+	return out.fetched, out.err
 }
 
 // openStoredForFeed opens the stored copy for a client that fell behind. An
 // unrecorded object is opened too: it is deleted only after this returns, and
 // the client holds it from then on (missHandoff.holdUnrecorded).
-func (p *Proxy) openStoredForFeed(ctx context.Context, a artifacts.Artifact, path string, storeErr error) (io.ReadCloser, error) {
+func (p *Proxy) openStoredForFeed(ctx context.Context, fetched fetchedArtifact, storeErr error) (io.ReadCloser, error) {
 	if storeErr != nil && !errors.Is(storeErr, errUnrecorded) {
 		return nil, storeErr
 	}
-	res, err := p.openStoredArtifact(ctx, a, path)
+	res, err := p.openStoredArtifact(ctx, fetched)
 	if err != nil {
 		return nil, err
 	}
