@@ -122,7 +122,7 @@ func (db *DB) GetVersionByPURL(purl string) (*Version, error) {
 		       yanked, source, enriched_at, created_at, updated_at
 		FROM versions WHERE purl = ?
 	`)
-	err := db.Get(&v, query, purl)
+	err := db.getPrepared(&v, query, purl)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -254,7 +254,7 @@ func (db *DB) GetArtifact(versionPURL, filename string) (*Artifact, error) {
 		       created_at, updated_at, source
 		FROM artifacts WHERE version_purl = ? AND filename = ?
 	`)
-	err := db.Get(&a, query, versionPURL, filename)
+	err := db.getPrepared(&a, query, versionPURL, filename)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -276,7 +276,7 @@ func (db *DB) GetCachedArtifact(packagePURL, versionPURL, filename string) (*Cac
 		WHERE packages.purl = ? AND artifacts.version_purl = ? AND artifacts.filename = ?
 		  AND artifacts.storage_path IS NOT NULL AND artifacts.fetched_at IS NOT NULL
 	`)
-	err := db.Get(&row, query, packagePURL, versionPURL, filename)
+	err := db.getPrepared(&row, query, packagePURL, versionPURL, filename)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -1336,7 +1336,7 @@ func (db *DB) GetMetadataCache(ecosystem, name string) (*MetadataCacheEntry, err
 		       content_digest, upstream_url, size, last_modified, fetched_at, last_accessed_at, created_at, updated_at
 		FROM metadata_cache WHERE ecosystem = ? AND name = ?
 	`)
-	err := db.Get(&entry, query, ecosystem, name)
+	err := db.getPrepared(&entry, query, ecosystem, name)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}

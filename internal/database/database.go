@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jmoiron/sqlx"
@@ -66,6 +67,7 @@ type DB struct {
 	dialect Dialect
 	path    string
 	hits    *hitBatch
+	stmts   sync.Map // query text -> *sqlx.Stmt, see getPrepared
 }
 
 func (db *DB) Dialect() Dialect {
@@ -225,6 +227,57 @@ func (db *DB) OptimizeForReads() error {
 		PRAGMA journal_mode = WAL;
 	`)
 	return err
+}
+
+// getPrepared is Get for a query on the request path. On SQLite it runs
+// query as a statement prepared on first use: the modernc driver keeps no
+// statement cache, so query text is parsed and planned again on every
+// call, about two thirds of a cache hit lookup. The statement runs on the
+// reader pool, like Get, and database/sql prepares it once on each reader
+// connection it uses. query must be constant text; it stays prepared until
+// Close.
+//
+// Postgres runs query as text, as before. A prepared statement there
+// fails with "cached plan must not change result type" once another
+// replica's migration changes a column type it reads, and breaks behind
+// PgBouncer in transaction pooling mode.
+func (db *DB) getPrepared(dest any, query string, args ...any) error {
+	if db.dialect != DialectSQLite {
+		return db.Get(dest, query, args...)
+	}
+	s, err := db.prepared(query)
+	if err != nil {
+		return err
+	}
+	return s.Get(dest, args...)
+}
+
+// prepared returns query prepared on the reader pool, preparing it on
+// first use.
+func (db *DB) prepared(query string) (*sqlx.Stmt, error) {
+	if s, ok := db.stmts.Load(query); ok {
+		return s.(*sqlx.Stmt), nil
+	}
+	s, err := db.reader.Preparex(query)
+	if err != nil {
+		return nil, err
+	}
+	// Another caller may have prepared it meanwhile; keep theirs.
+	if prev, loaded := db.stmts.LoadOrStore(query, s); loaded {
+		_ = s.Close()
+		return prev.(*sqlx.Stmt), nil
+	}
+	return s, nil
+}
+
+// closeStmts closes the statements prepared by prepared. sql.DB.Close
+// would close them too; this keeps the release explicit.
+func (db *DB) closeStmts() {
+	db.stmts.Range(func(query, s any) bool {
+		_ = s.(*sqlx.Stmt).Close()
+		db.stmts.Delete(query)
+		return true
+	})
 }
 
 func (db *DB) Path() string {

@@ -28,7 +28,7 @@ type metadataDateRow struct {
 // rewritten for proxyURL, or nil when there is none.
 func (db *DB) GetMetadataDate(ecosystem, proxyURL, name string) (*MetadataDate, error) {
 	var row metadataDateRow
-	err := db.Get(&row, db.Rebind(`
+	err := db.getPrepared(&row, db.Rebind(`
 		SELECT etag, last_modified FROM metadata_dates
 		WHERE ecosystem = ? AND proxy_url = ? AND name = ?
 	`), ecosystem, proxyURL, name)
