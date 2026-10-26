@@ -260,7 +260,26 @@ func (h *MavenHandler) handleDownload(w http.ResponseWriter, r *http.Request, so
 		return
 	}
 
+	if h.isArtifactFile(filename) {
+		result.checksums = h.checksumsFor(name, version, cacheFilename, result)
+	}
 	ServeArtifactRequest(w, r, result)
+}
+
+// checksumsFor returns the digests to send with a Maven file as
+// X-Checksum-SHA1 and X-Checksum-MD5. Maven resolvers verify the download
+// against them and skip their own request for the .sha1 beside it. They are
+// computed from the stored bytes when the file is fetched:
+//
+//	miss                      the digests the store computed
+//	hit                       the row's digests
+//	hit, row without digests  none (cached before migration 019)
+//	redirect (direct_serve)   none: a 302 carries no headers
+func (h *MavenHandler) checksumsFor(name, version, cacheFilename string, result *CacheResult) checksums {
+	if !result.Cached {
+		return h.proxy.recordedChecksums("maven", name, version, cacheFilename, result.Artifact.Digest)
+	}
+	return result.checksums
 }
 
 // parsePath extracts Maven coordinates from a URL path.
@@ -320,6 +339,12 @@ func (h *MavenHandler) isVersionListingFile(filename string) bool {
 // an artifact. They are as immutable as the artifact, so they are cached
 // with it rather than refetched on every request.
 func (h *MavenHandler) isChecksumFile(filename string) bool {
+	return isMavenChecksumFile(filename)
+}
+
+// isMavenChecksumFile is isChecksumFile for the store path, which has no
+// handler.
+func isMavenChecksumFile(filename string) bool {
 	for _, ext := range []string{".sha1", ".sha256", ".sha512", ".md5", ".asc"} {
 		if strings.HasSuffix(filename, ext) {
 			return true

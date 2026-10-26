@@ -87,7 +87,7 @@ func (db *DB) ClearExpiredArtifact(versionPURL, filename, storagePath string, cu
 	query := db.Rebind(`
 		UPDATE artifacts
 		SET storage_path = NULL, content_hash = NULL, size = NULL,
-		    content_type = NULL, fetched_at = NULL, updated_at = ?
+		    content_type = NULL, sha1 = NULL, md5 = NULL, fetched_at = NULL, updated_at = ?
 		WHERE version_purl = ? AND filename = ? AND storage_path = ? AND` + expiredCondition)
 	res, err := tx.Exec(query, time.Now(), versionPURL, filename, storagePath, cutoff.UTC(), cutoff.UTC())
 	if err != nil {

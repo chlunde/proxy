@@ -353,6 +353,8 @@ type CacheResult struct {
 	// rangeable is set on a HEAD cache hit, which has no Reader, when the
 	// stored object would open as a seekable reader.
 	rangeable bool
+	// checksums are sent as X-Checksum-* headers with the body.
+	checksums checksums
 }
 
 // GetOrFetchArtifact retrieves an artifact from cache or fetches from upstream.
@@ -539,6 +541,7 @@ func (p *Proxy) readStored(ctx context.Context, pkgPURL, versionPURL, filename s
 		Artifact:    artifact.Artifact,
 		Cached:      true,
 		storagePath: artifact.StoragePath,
+		checksums:   checksums{sha1: artifact.SHA1, md5: artifact.MD5},
 	}
 
 	if p.DirectServe {
@@ -692,7 +695,7 @@ func (p *Proxy) fetchAndCache(ctx context.Context, ecosystem, name, version, fil
 	}
 	metrics.RecordUpstreamFetch(ecosystem, fetchDuration)
 
-	return p.storeFetched(ctx, ecosystem, name, version, filename, pkgPURL, versionPURL, info.URL, "", "", artifact)
+	return p.storeFetched(ctx, ecosystem, name, version, filename, pkgPURL, versionPURL, info.URL, "", "", artifact, nil)
 }
 
 // storeArtifact writes a fetched artifact to storage, verifies it against
@@ -710,7 +713,7 @@ func (p *Proxy) fetchAndCache(ctx context.Context, ecosystem, name, version, fil
 //
 // It returns the artifact and its storage path, not a reader; callers get one
 // from openStoredArtifact.
-func (p *Proxy) storeArtifact(ctx context.Context, ecosystem, name, version, filename, pkgPURL, versionPURL, upstreamURL, upstreamHash, declared string, artifact *fetch.Artifact) (artifacts.Artifact, string, error) {
+func (p *Proxy) storeArtifact(ctx context.Context, ecosystem, name, version, filename, pkgPURL, versionPURL, upstreamURL, upstreamHash, declared string, artifact *fetch.Artifact, digests *bodyDigests) (artifacts.Artifact, string, error) {
 	storagePath := storage.FetchPath(ecosystem, name, version, storage.NewFetchID(), filename)
 
 	body, verified, err := verifyIntegrity(artifact.Body, declared)
@@ -720,7 +723,7 @@ func (p *Proxy) storeArtifact(ctx context.Context, ecosystem, name, version, fil
 	}
 
 	storeStart := time.Now()
-	size, hash, err := p.Storage.Store(ctx, storagePath, body)
+	size, hash, err := p.Storage.Store(ctx, storagePath, digests.tee(body))
 	_ = artifact.Body.Close()
 	metrics.RecordStorageOperation("write", time.Since(storeStart))
 	if err != nil {
@@ -768,7 +771,8 @@ func (p *Proxy) storeArtifact(ctx context.Context, ecosystem, name, version, fil
 	}
 
 	// Update database
-	if err := p.updateCacheDB(ecosystem, name, pkgPURL, upstreamURL, storagePath, sharedArtifact, declared); err != nil {
+	sums := digests.result()
+	if err := p.updateCacheDB(ecosystem, name, pkgPURL, upstreamURL, storagePath, sharedArtifact, declared, sums); err != nil {
 		if errors.Is(err, database.ErrLocalArtifactExists) {
 			p.Logger.Info("artifact was pushed while it was fetched; keeping the pushed copy",
 				"purl", versionPURL, "filename", filename)
@@ -1221,7 +1225,7 @@ func (p *Proxy) runScan(ctx context.Context, ecosystem, name, version, filename,
 	return nil
 }
 
-func (p *Proxy) updateCacheDB(ecosystem, name, pkgPURL, upstreamURL, storagePath string, artifact artifacts.Artifact, declared string) error {
+func (p *Proxy) updateCacheDB(ecosystem, name, pkgPURL, upstreamURL, storagePath string, artifact artifacts.Artifact, declared string, sums checksums) error {
 	now := time.Now()
 
 	// Upsert package
@@ -1249,6 +1253,8 @@ func (p *Proxy) updateCacheDB(ecosystem, name, pkgPURL, upstreamURL, storagePath
 		Size:        sql.NullInt64{Int64: artifact.Size, Valid: true},
 		ContentType: sql.NullString{String: artifact.MediaType, Valid: true},
 		FetchedAt:   sql.NullTime{Time: now, Valid: true},
+		SHA1:        nullString(sums.sha1),
+		MD5:         nullString(sums.md5),
 	}
 	// One transaction, so a push that landed while this was fetched keeps
 	// both its artifact and its version's integrity.
@@ -1301,6 +1307,7 @@ func serveArtifactResponse(w http.ResponseWriter, method string, request *http.R
 	if contentHash != "" {
 		w.Header().Set(headerETag, `"`+contentHash+`"`)
 	}
+	result.checksums.setHeaders(w.Header())
 
 	var seeker io.Seeker
 	if result.Reader != nil {
@@ -1344,6 +1351,7 @@ func serveArtifactRange(w http.ResponseWriter, request *http.Request, result *Ca
 	if !satisfiable {
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", result.Artifact.Size))
 		w.Header().Set(headerContentLength, "0")
+		deleteChecksumHeaders(w.Header())
 		w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
 		return true
 	}
@@ -1353,6 +1361,7 @@ func serveArtifactRange(w http.ResponseWriter, request *http.Request, result *Ca
 		w.Header().Del(headerContentLength)
 		w.Header().Del(headerETag)
 		w.Header().Del("Accept-Ranges")
+		deleteChecksumHeaders(w.Header())
 		http.Error(w, "failed to seek cached artifact", http.StatusInternalServerError)
 		return true
 	}
@@ -2519,7 +2528,7 @@ func (p *Proxy) cacheStoredCopy(ctx context.Context, ecosystem, name, version, f
 		p.Logger.Info("caching a stored copy", "ecosystem", ecosystem, "name", name, "version", version,
 			"source", source.StoragePath)
 		return p.storeArtifact(fetchCtx, ecosystem, name, version, filename, pkgPURL, versionPURL, upstreamURL, upstreamHash, "",
-			&fetch.Artifact{Body: body, Size: source.Size, ContentType: source.ContentType.String})
+			&fetch.Artifact{Body: body, Size: source.Size, ContentType: source.ContentType.String}, nil)
 	})
 }
 
@@ -2572,7 +2581,7 @@ func (p *Proxy) fetchAndCacheFromURL(ctx context.Context, ecosystem, name, versi
 		"ecosystem", ecosystem, "name", name, "version", version, "url", downloadURL)
 
 	fetchStart := time.Now()
-	artifact, err := p.fetchUpstream(ctx, downloadURL, headers)
+	artifact, digests, err := p.fetchHashed(ctx, ecosystem, filename, downloadURL, headers)
 	metrics.RecordUpstreamFetch(ecosystem, time.Since(fetchStart))
 	if err != nil {
 		metrics.RecordUpstreamError(ecosystem, "fetch_failed", metrics.FailureDetail{
@@ -2583,7 +2592,7 @@ func (p *Proxy) fetchAndCacheFromURL(ctx context.Context, ecosystem, name, versi
 		return artifacts.Artifact{}, "", fmt.Errorf("fetching from upstream: %w", err)
 	}
 
-	return p.storeFetched(ctx, ecosystem, name, version, filename, pkgPURL, versionPURL, downloadURL, upstreamHash, declared, artifact)
+	return p.storeFetched(ctx, ecosystem, name, version, filename, pkgPURL, versionPURL, downloadURL, upstreamHash, declared, artifact, digests)
 }
 
 type upstreamLastModifiedKey struct{}

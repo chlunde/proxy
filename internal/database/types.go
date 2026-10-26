@@ -151,6 +151,8 @@ type Artifact struct {
 	UpdatedAt      time.Time      `db:"updated_at" json:"updated_at"`
 	Source         string         `db:"source" json:"source"`
 	Manifest       sql.NullString `db:"manifest" json:"manifest,omitempty"`
+	SHA1           sql.NullString `db:"sha1" json:"sha1,omitempty"`
+	MD5            sql.NullString `db:"md5" json:"md5,omitempty"`
 }
 
 func (a *Artifact) sourceOrUpstream() string {
@@ -171,6 +173,10 @@ type CachedArtifact struct {
 	StoragePath string
 	Artifact    artifacts.Artifact
 	Integrity   sql.NullString
+	// SHA1 and MD5 are the hex digests of a Maven file, computed when it
+	// was stored; empty for rows from before migration 019.
+	SHA1 string
+	MD5  string
 }
 
 // MetadataCacheEntry represents a cached metadata blob for offline serving.

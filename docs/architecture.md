@@ -157,7 +157,9 @@ artifacts (
     hit_count      INTEGER DEFAULT 0, -- BIGINT on Postgres
     last_accessed_at DATETIME,
     created_at     DATETIME,
-    updated_at     DATETIME
+    updated_at     DATETIME,
+    sha1           TEXT,              -- hex, computed on store (Maven)
+    md5            TEXT               -- hex, computed on store (Maven)
 )
 -- indexes: (version_purl, filename) unique, storage_path, last_accessed_at
 

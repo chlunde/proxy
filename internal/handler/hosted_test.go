@@ -532,7 +532,7 @@ func TestCacheFillAfterPushKeepsThePush(t *testing.T) {
 	}
 	fetched := testArtifact("upstream bytes", "pkg:npm/request@2.88.3", "request-2.88.3.tgz", "application/gzip")
 	err := proxy.updateCacheDB("npm", "request", "pkg:npm/request", "https://registry.npmjs.org/request/-/request-2.88.3.tgz",
-		fetchedPath, fetched, "sha512-upstream")
+		fetchedPath, fetched, "sha512-upstream", checksums{})
 	if !errors.Is(err, database.ErrLocalArtifactExists) {
 		t.Fatalf("updateCacheDB over a push error = %v, want ErrLocalArtifactExists", err)
 	}

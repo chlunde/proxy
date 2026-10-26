@@ -75,7 +75,9 @@ CREATE TABLE IF NOT EXISTS artifacts (
 	created_at DATETIME,
 	updated_at DATETIME,
 	source TEXT NOT NULL DEFAULT 'upstream',
-	manifest TEXT
+	manifest TEXT,
+	sha1 TEXT,
+	md5 TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_version_filename ON artifacts(version_purl, filename);
 CREATE INDEX IF NOT EXISTS idx_artifacts_storage_path ON artifacts(storage_path);
@@ -232,7 +234,9 @@ CREATE TABLE IF NOT EXISTS artifacts (
 	created_at TIMESTAMP,
 	updated_at TIMESTAMP,
 	source TEXT NOT NULL DEFAULT 'upstream',
-	manifest TEXT
+	manifest TEXT,
+	sha1 TEXT,
+	md5 TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_version_filename ON artifacts(version_purl, filename);
 CREATE INDEX IF NOT EXISTS idx_artifacts_storage_path ON artifacts(storage_path);
@@ -348,7 +352,9 @@ CREATE TABLE IF NOT EXISTS artifacts (
 	created_at DATETIME,
 	updated_at DATETIME,
 	source TEXT NOT NULL DEFAULT 'upstream',
-	manifest TEXT
+	manifest TEXT,
+	sha1 TEXT,
+	md5 TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_version_filename ON artifacts(version_purl, filename);
 CREATE INDEX IF NOT EXISTS idx_artifacts_storage_path ON artifacts(storage_path);
@@ -373,7 +379,9 @@ CREATE TABLE IF NOT EXISTS artifacts (
 	created_at TIMESTAMP,
 	updated_at TIMESTAMP,
 	source TEXT NOT NULL DEFAULT 'upstream',
-	manifest TEXT
+	manifest TEXT,
+	sha1 TEXT,
+	md5 TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_version_filename ON artifacts(version_purl, filename);
 CREATE INDEX IF NOT EXISTS idx_artifacts_storage_path ON artifacts(storage_path);
@@ -497,6 +505,7 @@ var migrations = []migration{
 	{"018_add_upstream_holds", migrateAddUpstreamHolds},
 	{"019_add_artifact_filename_index", migrateAddArtifactFilenameIndex},
 	{"020_add_metadata_snapshots", migrateAddMetadataSnapshots},
+	{"021_add_artifact_checksums", migrateAddArtifactChecksums},
 }
 
 // isTableNotFound returns true if the error indicates a missing table.
@@ -1049,6 +1058,25 @@ func migrateAddMetadataLastAccessed(db *DB) error {
 	for _, q := range indexes {
 		if _, err := db.Exec(q); err != nil {
 			return fmt.Errorf("indexing metadata_cache: %w", err)
+		}
+	}
+	return nil
+}
+
+// migrateAddArtifactChecksums stores the SHA-1 and MD5 of a Maven file,
+// which clients read from X-Checksum-* headers instead of fetching .sha1
+// files. Existing rows stay NULL until they are fetched again.
+func migrateAddArtifactChecksums(db *DB) error {
+	for _, col := range []string{"sha1", "md5"} {
+		hasCol, err := db.HasColumn("artifacts", col)
+		if err != nil {
+			return fmt.Errorf("checking column %s: %w", col, err)
+		}
+		if hasCol {
+			continue
+		}
+		if _, err := db.Exec("ALTER TABLE artifacts ADD COLUMN " + col + " TEXT"); err != nil {
+			return fmt.Errorf("adding column %s to artifacts: %w", col, err)
 		}
 	}
 	return nil
