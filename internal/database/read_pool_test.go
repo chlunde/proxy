@@ -298,6 +298,41 @@ func TestIsMemoryPath(t *testing.T) {
 	}
 }
 
+// TestSQLitePathWithQuery opens SQLite URIs that carry their own query.
+// Open adds its connection parameters to the path, so they must be joined
+// with '&' there, not start a second query with '?'.
+func TestSQLitePathWithQuery(t *testing.T) {
+	for _, path := range []string{
+		"file::memory:?cache=shared",
+		"file:mem?mode=memory",
+		"file:" + filepath.Join(t.TempDir(), "uri.db") + "?cache=private",
+	} {
+		db, err := Create(path)
+		if err != nil {
+			t.Errorf("Create(%q): %v", path, err)
+			continue
+		}
+		var timeout int
+		if err := db.Get(&timeout, "PRAGMA busy_timeout"); err != nil || timeout != 5000 {
+			t.Errorf("Create(%q): busy_timeout = %d, %v; want 5000", path, timeout, err)
+		}
+		_ = db.Close()
+	}
+}
+
+// TestSQLiteURIReopen restarts on a "file:" URI with a query. The second
+// start must open the file, not see it as missing and create it again.
+func TestSQLiteURIReopen(t *testing.T) {
+	path := "file:" + filepath.Join(t.TempDir(), "sub", "uri.db") + "?cache=private"
+	for i := range 2 {
+		db, err := OpenOrCreate(path)
+		if err != nil {
+			t.Fatalf("start %d: OpenOrCreate(%q): %v", i+1, path, err)
+		}
+		_ = db.Close()
+	}
+}
+
 // TestSQLiteExistingRollbackJournalDatabase opens a database file left in
 // rollback-journal mode, as an older or foreign tool may leave it. The
 // writer must switch it to WAL before readers open it, or reads would block
@@ -389,5 +424,19 @@ func TestSQLiteConcurrentReadsAndWrites(t *testing.T) {
 	close(errs)
 	for err := range errs {
 		t.Error(err)
+	}
+}
+
+func TestSQLiteFile(t *testing.T) {
+	for path, want := range map[string]string{
+		"/var/lib/proxy.db":                    "/var/lib/proxy.db",
+		"file:/var/lib/proxy.db?cache=private": "/var/lib/proxy.db",
+		"file:///var/lib/proxy.db":             "/var/lib/proxy.db",
+		"file://localhost/var/lib/proxy.db":    "/var/lib/proxy.db",
+		"file:cache.db":                        "cache.db",
+	} {
+		if got := sqliteFile(path); got != want {
+			t.Errorf("sqliteFile(%q) = %q, want %q", path, got, want)
+		}
 	}
 }

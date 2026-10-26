@@ -73,13 +73,13 @@ func (db *DB) Dialect() Dialect {
 }
 
 func Exists(path string) bool {
-	_, err := os.Stat(path)
+	_, err := os.Stat(sqliteFile(path))
 	return err == nil
 }
 
 func Create(path string) (*DB, error) {
 	if Exists(path) {
-		if err := os.Remove(path); err != nil {
+		if err := os.Remove(sqliteFile(path)); err != nil {
 			return nil, fmt.Errorf("removing existing database: %w", err)
 		}
 	}
@@ -98,13 +98,13 @@ func Create(path string) (*DB, error) {
 }
 
 func Open(path string) (*DB, error) {
-	if dir := filepath.Dir(path); dir != "." && dir != "/" {
+	if dir := filepath.Dir(sqliteFile(path)); dir != "." && dir != "/" {
 		if err := os.MkdirAll(dir, dirPermissions); err != nil {
 			return nil, fmt.Errorf("creating database directory: %w", err)
 		}
 	}
 
-	writer, err := sqlx.Open("sqlite", path+sqliteWriterParams)
+	writer, err := sqlx.Open("sqlite", sqliteDSN(path, sqliteWriterParams))
 	if err != nil {
 		return nil, fmt.Errorf("opening database: %w", err)
 	}
@@ -125,7 +125,7 @@ func Open(path string) (*DB, error) {
 		return db, nil
 	}
 
-	reader, err := sqlx.Open("sqlite", path+sqliteReaderParams)
+	reader, err := sqlx.Open("sqlite", sqliteDSN(path, sqliteReaderParams))
 	if err != nil {
 		_ = writer.Close()
 		return nil, fmt.Errorf("opening database reader: %w", err)
@@ -136,6 +136,34 @@ func Open(path string) (*DB, error) {
 	db.reader = reader
 
 	return db, nil
+}
+
+// sqliteDSN adds params, a query, to path. A path with a query of its own,
+// as in "file::memory:?cache=shared", gets them joined with '&'.
+func sqliteDSN(path, params string) string {
+	if strings.Contains(path, "?") {
+		return path + "&" + strings.TrimPrefix(params, "?")
+	}
+	return path + params
+}
+
+// sqliteFile returns the file a SQLite path names, without the "file:"
+// scheme and query of a URI:
+//
+//	file:/var/lib/proxy.db?cache=private -> /var/lib/proxy.db
+//	file:///var/lib/proxy.db             -> /var/lib/proxy.db
+func sqliteFile(path string) string {
+	file, ok := strings.CutPrefix(path, "file:")
+	if !ok {
+		return path
+	}
+	file, _, _ = strings.Cut(file, "?")
+	if rest, ok := strings.CutPrefix(file, "//"); ok {
+		// Drop the authority, empty or "localhost".
+		_, file, _ = strings.Cut(rest, "/")
+		file = "/" + file
+	}
+	return file
 }
 
 func sqliteReaderConns() int {
