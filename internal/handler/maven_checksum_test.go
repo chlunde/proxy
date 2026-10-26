@@ -135,28 +135,6 @@ func centralHeaders(sha1, md5 string) http.Header {
 	return http.Header{"x-checksum-sha1": {sha1}, "x-checksum-md5": {md5}}
 }
 
-// Digests upstream sends as headers are not passed on: clients get those
-// of the bytes the proxy stored, on the fetch, on hits and on HEAD, and the
-// file is fetched once.
-func TestMavenChecksumIgnoresUpstreamHeaders(t *testing.T) {
-	h, upstream, _, _ := newChecksumHandler(t, map[string]string{mavenJarPath: checksumTestJar})
-	upstream.headers = map[string]http.Header{
-		mavenJarPath: centralHeaders(strings.Repeat("0", 40), strings.Repeat("0", 32)),
-	}
-	for _, step := range []struct{ name, method string }{
-		{"cold", http.MethodGet}, {"hot", http.MethodGet}, {"head", http.MethodHead},
-	} {
-		w := requestMaven(h, step.method, mavenJarPath)
-		if w.Code != http.StatusOK {
-			t.Fatalf("%s: status = %d", step.name, w.Code)
-		}
-		assertChecksumHeaders(t, step.name, w, checksumTestSHA1, checksumTestMD5)
-	}
-	if n := upstream.count(mavenJarPath); n != 1 {
-		t.Errorf("upstream jar requests = %d, want 1", n)
-	}
-}
-
 // Concurrent cold requests sharing one upstream fetch all get the digests.
 func TestMavenChecksumHeadersCoalescedMisses(t *testing.T) {
 	h, upstream, _, _ := newChecksumHandler(t, map[string]string{mavenJarPath: checksumTestJar})
@@ -387,7 +365,7 @@ func TestStoreArtifactHashesMaven(t *testing.T) {
 		t.Fatal(err)
 	}
 	fetched, err := proxy.storeArtifact(context.Background(), "maven", name, version, filename, pkgPURL, versionPURL,
-		"https://repo.example/"+filename, "", "", &fetch.Artifact{Body: io.NopCloser(strings.NewReader(checksumTestJar)), Size: -1}, time.Time{})
+		"https://repo.example/"+filename, "", "", &fetch.Artifact{Body: io.NopCloser(strings.NewReader(checksumTestJar)), Size: -1}, upstreamMeta{})
 	if err != nil {
 		t.Fatalf("storeArtifact: %v", err)
 	}
@@ -396,5 +374,111 @@ func TestStoreArtifactHashesMaven(t *testing.T) {
 	}
 	if sha1, md5 := rowChecksums(t, proxy, filename); sha1.String != checksumTestSHA1 || md5.String != checksumTestMD5 {
 		t.Errorf("row = %v, %v", sha1, md5)
+	}
+}
+
+// requestMavenStreamed marks the request as the server marks a GET, so a
+// cache miss is sent while it is stored.
+func requestMavenStreamed(h http.Handler, path string) *httptest.ResponseRecorder {
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, path, nil)
+	ctx := DetachUpstreamFetch(StreamCacheMiss(r.Context()))
+	h.ServeHTTP(w, r.WithContext(ctx))
+	return w
+}
+
+// A streamed miss sends its headers before the proxy has hashed the bytes,
+// so it passes on the digests upstream sent; hits send the stored ones.
+// Either way the client skips the .sha1.
+func TestMavenChecksumStreamedMissPassesUpstream(t *testing.T) {
+	h, upstream, _, _ := newChecksumHandler(t, map[string]string{mavenJarPath: checksumTestJar})
+	upstream.headers = map[string]http.Header{mavenJarPath: centralHeaders(checksumTestSHA1, checksumTestMD5)}
+	w := requestMavenStreamed(h, mavenJarPath)
+	if w.Code != http.StatusOK || w.Body.String() != checksumTestJar {
+		t.Fatalf("miss: status = %d, body = %q", w.Code, w.Body)
+	}
+	assertChecksumHeaders(t, "miss", w, checksumTestSHA1, checksumTestMD5)
+	waitChecksumRow(t, h)
+	assertChecksumHeaders(t, "hit", requestMavenStreamed(h, mavenJarPath), checksumTestSHA1, checksumTestMD5)
+	if n := upstream.count(mavenJarPath); n != 1 {
+		t.Errorf("upstream jar requests = %d, want 1", n)
+	}
+}
+
+// Without upstream digests a streamed miss has none to send; the hit
+// sends those computed when it was stored.
+func TestMavenChecksumStreamedMissWithoutHeaders(t *testing.T) {
+	h, _, _, _ := newChecksumHandler(t, map[string]string{mavenJarPath: checksumTestJar})
+	assertChecksumHeaders(t, "miss", requestMavenStreamed(h, mavenJarPath), "", "")
+	waitChecksumRow(t, h)
+	assertChecksumHeaders(t, "hit", requestMavenStreamed(h, mavenJarPath), checksumTestSHA1, checksumTestMD5)
+}
+
+// A body that doesn't match upstream's SHA-1 is aborted before its last
+// bytes and not cached.
+func TestMavenChecksumStreamedMissMismatch(t *testing.T) {
+	h, upstream, _, _ := newChecksumHandler(t, map[string]string{mavenJarPath: checksumTestJar})
+	upstream.headers = map[string]http.Header{mavenJarPath: centralHeaders(strings.Repeat("0", 40), checksumTestMD5)}
+	w, aborted := serveRecovering(h, mavenJarPath)
+	if !aborted && w.Body.String() == checksumTestJar {
+		t.Fatal("client got every byte of a file that doesn't match upstream's SHA-1")
+	}
+	time.Sleep(100 * time.Millisecond)
+	serveRecovering(h, mavenJarPath)
+	if n := upstream.count(mavenJarPath); n != 2 {
+		t.Errorf("upstream jar requests = %d, want 2 (mismatch not cached)", n)
+	}
+}
+
+// A buffered miss whose bytes don't match upstream's SHA-1 fails and is
+// not cached.
+func TestMavenChecksumMismatchRejected(t *testing.T) {
+	h, upstream, _, _ := newChecksumHandler(t, map[string]string{mavenJarPath: checksumTestJar})
+	upstream.headers = map[string]http.Header{mavenJarPath: centralHeaders(strings.Repeat("0", 40), checksumTestMD5)}
+	if w := requestMaven(h, http.MethodGet, mavenJarPath); w.Code == http.StatusOK {
+		t.Fatalf("status = %d, want an error", w.Code)
+	}
+	requestMaven(h, http.MethodGet, mavenJarPath)
+	if n := upstream.count(mavenJarPath); n != 2 {
+		t.Errorf("upstream jar requests = %d, want 2 (mismatch not cached)", n)
+	}
+}
+
+// A malformed upstream digest is neither passed on nor checked.
+func TestMavenChecksumMalformedUpstream(t *testing.T) {
+	h, upstream, _, _ := newChecksumHandler(t, map[string]string{mavenJarPath: checksumTestJar})
+	upstream.headers = map[string]http.Header{mavenJarPath: centralHeaders("not-a-digest", "xyz")}
+	w := requestMavenStreamed(h, mavenJarPath)
+	if w.Code != http.StatusOK || w.Body.String() != checksumTestJar {
+		t.Fatalf("status = %d, body = %q", w.Code, w.Body)
+	}
+	assertChecksumHeaders(t, "miss", w, "", "")
+}
+
+// serveRecovering serves a streamed GET, reporting whether the handler
+// aborted the response as net/http would.
+func serveRecovering(h http.Handler, path string) (w *httptest.ResponseRecorder, aborted bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			if r != http.ErrAbortHandler {
+				panic(r)
+			}
+			aborted = true
+		}
+	}()
+	return requestMavenStreamed(h, path), false
+}
+
+// waitChecksumRow waits until the streamed miss is stored, which happens
+// after the client's response ends.
+func waitChecksumRow(t *testing.T, h http.Handler) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		w := requestMaven(h, http.MethodHead, mavenJarPath)
+		if w.Header().Get("X-Checksum-SHA1") != "" {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
