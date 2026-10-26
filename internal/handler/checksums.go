@@ -6,10 +6,13 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"hash"
 	"io"
 	"net/http"
 	"strings"
+
+	"github.com/git-pkgs/integrity"
 )
 
 // Maven resolvers verify a download against X-Checksum-SHA1/MD5 and then
@@ -47,6 +50,33 @@ func (c checksums) setHeaders(h http.Header) {
 func deleteChecksumHeaders(h http.Header) {
 	h.Del(headerChecksumSHA1)
 	h.Del(headerChecksumMD5)
+}
+
+// upstreamChecksums returns the digests a Maven repository sent as
+// X-Checksum-*, such as Maven Central. A value that isn't a hex digest of
+// the right length is left out.
+//
+//	X-Checksum-Sha1: 161ba27964a62f241533807a46b8711b13c1d94b
+func upstreamChecksums(h http.Header) checksums {
+	valid := func(name string, alg integrity.Algorithm) string {
+		v := strings.ToLower(strings.TrimSpace(h.Get(name)))
+		if _, err := integrity.ParseHex(alg, v); err != nil {
+			return ""
+		}
+		return v
+	}
+	return checksums{sha1: valid(headerChecksumSHA1, integrity.SHA1), md5: valid(headerChecksumMD5, integrity.MD5)}
+}
+
+// mismatch compares computed digests c with those upstream sent.
+func (c checksums) mismatch(sent checksums) error {
+	if sent.sha1 != "" && sent.sha1 != c.sha1 {
+		return fmt.Errorf("%w: upstream sent SHA-1 %s, got %s", ErrArtifactDigestMismatch, sent.sha1, c.sha1)
+	}
+	if sent.md5 != "" && sent.md5 != c.md5 {
+		return fmt.Errorf("%w: upstream sent MD5 %s, got %s", ErrArtifactDigestMismatch, sent.md5, c.md5)
+	}
+	return nil
 }
 
 // bodyDigests computes the SHA-1 and MD5 of a body read through tee.

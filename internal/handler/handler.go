@@ -410,8 +410,8 @@ func (p *Proxy) GetOrFetchArtifact(ctx context.Context, ecosystem, name, version
 			}
 		}
 		return p.streamFromUpstream(ctx, ecosystem, name, version, filename, versionPURL, info.URL, "", "",
-			func(fetchCtx context.Context) (*fetch.Artifact, time.Time, error) {
-				return p.fetchDated(fetchCtx, ecosystem, info.URL, nil)
+			func(fetchCtx context.Context) (*fetch.Artifact, upstreamMeta, error) {
+				return p.fetchMeta(fetchCtx, ecosystem, info.URL, nil)
 			})
 	}
 	if cached, err := p.checkCache(ctx, pkgPURL, versionPURL, filename); err != nil {
@@ -645,7 +645,7 @@ func (p *Proxy) fetchAndCache(ctx context.Context, ecosystem, name, version, fil
 
 	// Fetch from upstream with timing
 	fetchStart := time.Now()
-	artifact, lastModified, err := p.fetchDated(ctx, ecosystem, info.URL, nil)
+	artifact, meta, err := p.fetchMeta(ctx, ecosystem, info.URL, nil)
 	fetchDuration := time.Since(fetchStart)
 
 	if err != nil {
@@ -659,7 +659,7 @@ func (p *Proxy) fetchAndCache(ctx context.Context, ecosystem, name, version, fil
 	}
 	metrics.RecordUpstreamFetch(ecosystem, fetchDuration)
 
-	return p.storeFetched(ctx, ecosystem, name, version, filename, pkgPURL, versionPURL, info.URL, "", "", artifact, lastModified)
+	return p.storeFetched(ctx, ecosystem, name, version, filename, pkgPURL, versionPURL, info.URL, "", "", artifact, meta)
 }
 
 // storeArtifact writes a fetched artifact to storage, verifies it against
@@ -677,7 +677,7 @@ func (p *Proxy) fetchAndCache(ctx context.Context, ecosystem, name, version, fil
 //
 // It returns the artifact and its storage path, not a reader; callers get one
 // from openStoredArtifact.
-func (p *Proxy) storeArtifact(ctx context.Context, ecosystem, name, version, filename, pkgPURL, versionPURL, upstreamURL, upstreamHash, declared string, artifact *fetch.Artifact, lastModified time.Time) (fetchedArtifact, error) {
+func (p *Proxy) storeArtifact(ctx context.Context, ecosystem, name, version, filename, pkgPURL, versionPURL, upstreamURL, upstreamHash, declared string, artifact *fetch.Artifact, meta upstreamMeta) (fetchedArtifact, error) {
 	storagePath := storage.FetchPath(ecosystem, name, version, storage.NewFetchID(), filename)
 
 	body, verified, err := verifyIntegrity(artifact.Body, declared)
@@ -702,6 +702,15 @@ func (p *Proxy) storeArtifact(ctx context.Context, ecosystem, name, version, fil
 			p.Logger.Warn("failed to discard artifact with mismatched checksum", "path", storagePath, "error", delErr)
 		}
 		return fetchedArtifact{}, fmt.Errorf("%w: upstream declared %s, got %s", ErrArtifactDigestMismatch, upstreamHash, hash)
+	}
+	sums := digests.result()
+	if err := sums.mismatch(meta.sums); digests != nil && err != nil {
+		p.Logger.Error("fetched artifact doesn't match upstream's X-Checksum",
+			"purl", versionPURL, "filename", filename, "url", upstreamURL, "error", err)
+		if delErr := p.Storage.Delete(ctx, storagePath); delErr != nil {
+			p.Logger.Warn("failed to discard artifact with mismatched checksum", "path", storagePath, "error", delErr)
+		}
+		return fetchedArtifact{}, err
 	}
 	if err := verified(); err != nil {
 		p.Logger.Error("fetched artifact failed integrity check",
@@ -736,8 +745,7 @@ func (p *Proxy) storeArtifact(ctx context.Context, ecosystem, name, version, fil
 	}
 
 	// Update database
-	sums := digests.result()
-	if err := p.updateCacheDB(ecosystem, name, pkgPURL, upstreamURL, storagePath, sharedArtifact, declared, lastModified, sums); err != nil {
+	if err := p.updateCacheDB(ecosystem, name, pkgPURL, upstreamURL, storagePath, sharedArtifact, declared, meta.lastModified, sums); err != nil {
 		if errors.Is(err, database.ErrLocalArtifactExists) {
 			p.Logger.Info("artifact was pushed while it was fetched; keeping the pushed copy",
 				"purl", versionPURL, "filename", filename)
@@ -749,7 +757,7 @@ func (p *Proxy) storeArtifact(ctx context.Context, ecosystem, name, version, fil
 		if qErr := p.DB.QueuePendingDelete(storagePath); qErr != nil && !p.recordedAt(versionPURL, filename, storagePath) {
 			p.Logger.Warn("failed to queue unrecorded artifact for deletion, deleting it once served",
 				"path", storagePath, "error", qErr)
-			return fetchedArtifact{artifact: sharedArtifact, storagePath: storagePath, lastModified: lastModified, sums: sums}, errUnrecorded
+			return fetchedArtifact{artifact: sharedArtifact, storagePath: storagePath, lastModified: meta.lastModified, sums: sums}, errUnrecorded
 		}
 	} else if mirrorFetch(ctx) {
 		if err := p.DB.MarkArtifactMirrored(versionPURL, filename); err != nil {
@@ -759,7 +767,7 @@ func (p *Proxy) storeArtifact(ctx context.Context, ecosystem, name, version, fil
 
 	// The date goes with these bytes even if the record was not written, so
 	// a response never carries another fetch's date.
-	return fetchedArtifact{artifact: sharedArtifact, storagePath: storagePath, lastModified: lastModified, sums: sums}, nil
+	return fetchedArtifact{artifact: sharedArtifact, storagePath: storagePath, lastModified: meta.lastModified, sums: sums}, nil
 }
 
 // recordedAt reports whether the artifact's record points at storagePath. A
@@ -2610,8 +2618,8 @@ func (p *Proxy) getOrFetchArtifactFromURLWithCachePURLs(ctx context.Context, eco
 	}
 	if p.StreamArtifacts {
 		return p.streamFromUpstream(ctx, ecosystem, name, version, filename, versionPURL, downloadURL, upstreamHash, declared,
-			func(fetchCtx context.Context) (*fetch.Artifact, time.Time, error) {
-				return p.fetchDated(fetchCtx, ecosystem, downloadURL, headers)
+			func(fetchCtx context.Context) (*fetch.Artifact, upstreamMeta, error) {
+				return p.fetchMeta(fetchCtx, ecosystem, downloadURL, headers)
 			})
 	}
 	if cached, err := p.getCachedArtifactWithUpstreamHash(ctx, pkgPURL, versionPURL, filename, upstreamHash); err != nil {
@@ -2660,7 +2668,7 @@ func (p *Proxy) cacheStoredCopy(ctx context.Context, ecosystem, name, version, f
 		p.Logger.Info("caching a stored copy", "ecosystem", ecosystem, "name", name, "version", version,
 			"source", source.StoragePath)
 		return p.storeArtifact(fetchCtx, ecosystem, name, version, filename, pkgPURL, versionPURL, upstreamURL, upstreamHash, "",
-			&fetch.Artifact{Body: body, Size: source.Size, ContentType: source.ContentType.String}, time.Time{})
+			&fetch.Artifact{Body: body, Size: source.Size, ContentType: source.ContentType.String}, upstreamMeta{})
 	})
 }
 
@@ -2746,7 +2754,7 @@ func (p *Proxy) fetchAndCacheFromURL(ctx context.Context, ecosystem, name, versi
 		"ecosystem", ecosystem, "name", name, "version", version, "url", downloadURL)
 
 	fetchStart := time.Now()
-	artifact, lastModified, err := p.fetchDated(ctx, ecosystem, downloadURL, headers)
+	artifact, meta, err := p.fetchMeta(ctx, ecosystem, downloadURL, headers)
 	metrics.RecordUpstreamFetch(ecosystem, time.Since(fetchStart))
 	if err != nil {
 		metrics.RecordUpstreamError(ecosystem, "fetch_failed", metrics.FailureDetail{
@@ -2757,7 +2765,7 @@ func (p *Proxy) fetchAndCacheFromURL(ctx context.Context, ecosystem, name, versi
 		return fetchedArtifact{}, fmt.Errorf("fetching from upstream: %w", err)
 	}
 
-	return p.storeFetched(ctx, ecosystem, name, version, filename, pkgPURL, versionPURL, downloadURL, upstreamHash, declared, artifact, lastModified)
+	return p.storeFetched(ctx, ecosystem, name, version, filename, pkgPURL, versionPURL, downloadURL, upstreamHash, declared, artifact, meta)
 }
 
 type upstreamHeadersKey struct{}
@@ -2905,7 +2913,7 @@ func (p *Proxy) fetchUpstreamURL(ctx context.Context, downloadURL string, header
 // unknown so the response goes out chunked: a mismatch only shows at EOF,
 // after the bytes have been sent, and an unterminated chunked response is the
 // only way left to make the client reject them (see serveArtifact).
-func (p *Proxy) streamFromUpstream(ctx context.Context, ecosystem, name, version, filename, versionPURL, upstreamURL, upstreamHash, declared string, fetchArtifact func(context.Context) (*fetch.Artifact, time.Time, error)) (*CacheResult, error) {
+func (p *Proxy) streamFromUpstream(ctx context.Context, ecosystem, name, version, filename, versionPURL, upstreamURL, upstreamHash, declared string, fetchArtifact func(context.Context) (*fetch.Artifact, upstreamMeta, error)) (*CacheResult, error) {
 	if err := p.upstreamHeld(upstreamURL); err != nil {
 		return nil, err
 	}
@@ -2913,7 +2921,7 @@ func (p *Proxy) streamFromUpstream(ctx context.Context, ecosystem, name, version
 		"ecosystem", ecosystem, "name", name, "version", version, "url", upstreamURL)
 
 	fetchStart := time.Now()
-	artifact, lastModified, err := fetchArtifact(ctx)
+	artifact, meta, err := fetchArtifact(ctx)
 	metrics.RecordUpstreamFetch(ecosystem, time.Since(fetchStart))
 	if err != nil {
 		metrics.RecordUpstreamError(ecosystem, "fetch_failed", metrics.FailureDetail{
@@ -2941,7 +2949,7 @@ func (p *Proxy) streamFromUpstream(ctx context.Context, ecosystem, name, version
 			Filename:  filename,
 			MediaType: artifact.ContentType,
 		},
-		LastModified: lastModified,
+		LastModified: meta.lastModified,
 	}
 	if upstreamHash == "" && declared == "" {
 		return result, nil

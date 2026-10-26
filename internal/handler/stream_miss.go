@@ -7,7 +7,6 @@ import (
 	"io"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/git-pkgs/artifacts"
 	"github.com/git-pkgs/proxy/internal/metrics"
@@ -138,12 +137,12 @@ func (p *Proxy) runSharedFetchStreaming(ctx context.Context, key string, f *infl
 // storeFetched stores an artifact fetched from upstream. When the caller
 // that started the fetch is waiting for a stream, it is sent the bytes as
 // they are stored; see storeWhileServing.
-func (p *Proxy) storeFetched(ctx context.Context, ecosystem, name, version, filename, pkgPURL, versionPURL, upstreamURL, upstreamHash, declared string, artifact *fetch.Artifact, lastModified time.Time) (fetchedArtifact, error) {
+func (p *Proxy) storeFetched(ctx context.Context, ecosystem, name, version, filename, pkgPURL, versionPURL, upstreamURL, upstreamHash, declared string, artifact *fetch.Artifact, meta upstreamMeta) (fetchedArtifact, error) {
 	h := handoffFrom(ctx)
 	if h == nil || p.Scanners.Blocks(ecosystem) {
-		return p.storeArtifact(ctx, ecosystem, name, version, filename, pkgPURL, versionPURL, upstreamURL, upstreamHash, declared, artifact, lastModified)
+		return p.storeArtifact(ctx, ecosystem, name, version, filename, pkgPURL, versionPURL, upstreamURL, upstreamHash, declared, artifact, meta)
 	}
-	return p.storeWhileServing(ctx, h, ecosystem, name, version, filename, pkgPURL, versionPURL, upstreamURL, upstreamHash, declared, artifact, lastModified)
+	return p.storeWhileServing(ctx, h, ecosystem, name, version, filename, pkgPURL, versionPURL, upstreamURL, upstreamHash, declared, artifact, meta)
 }
 
 // errNoReaderLeft stops reading upstream once neither storage nor the
@@ -154,9 +153,19 @@ var errNoReaderLeft = errors.New("neither storage nor the client is reading the 
 // once, at the upstream's speed; see missFeed for a client that can't keep up.
 // The client's copy is checked before its last bytes, so a mismatch aborts
 // the response. A storage failure leaves the client's copy running.
-func (p *Proxy) storeWhileServing(ctx context.Context, h *missHandoff, ecosystem, name, version, filename, pkgPURL, versionPURL, upstreamURL, upstreamHash, declared string, artifact *fetch.Artifact, lastModified time.Time) (fetchedArtifact, error) {
+func (p *Proxy) storeWhileServing(ctx context.Context, h *missHandoff, ecosystem, name, version, filename, pkgPURL, versionPURL, upstreamURL, upstreamHash, declared string, artifact *fetch.Artifact, meta upstreamMeta) (fetchedArtifact, error) {
 	hash := strings.ToLower(upstreamHash)
-	checks, err := newIntegrityChecks(hash, declared)
+	// Upstream's X-Checksum-* go out before the body is hashed, so the
+	// client's copy is checked against its SHA-1 too.
+	var sent checksums
+	clientDeclared := declared
+	if digestsFor(ecosystem, filename) != nil {
+		sent = meta.sums
+		if clientDeclared == "" && sent.sha1 != "" {
+			clientDeclared = "sha1:" + sent.sha1
+		}
+	}
+	checks, err := newIntegrityChecks(hash, clientDeclared)
 	if err != nil {
 		_ = artifact.Body.Close()
 		return fetchedArtifact{}, err
@@ -164,7 +173,7 @@ func (p *Proxy) storeWhileServing(ctx context.Context, h *missHandoff, ecosystem
 
 	feed := newMissFeed(clientFeedLimit)
 	var client io.ReadCloser = feed
-	if hash != "" || declared != "" {
+	if hash != "" || clientDeclared != "" {
 		if client, err = checks.wrapFailOnMismatch(feed, func(reason string) {
 			p.Logger.Warn("artifact sent on a cache miss failed its integrity check; aborting the response",
 				"purl", versionPURL, "filename", filename, "reason", reason)
@@ -183,14 +192,15 @@ func (p *Proxy) storeWhileServing(ctx context.Context, h *missHandoff, ecosystem
 			// can still be aborted.
 			Size: -1,
 		},
-		LastModified: lastModified,
+		LastModified: meta.lastModified,
+		checksums:    sent,
 	}
 	if hash != "" {
 		stream.Artifact.Digest = digest.Digest("sha256:" + hash)
 	}
 	if !h.offer(stream) {
 		_ = feed.Close()
-		return p.storeArtifact(ctx, ecosystem, name, version, filename, pkgPURL, versionPURL, upstreamURL, upstreamHash, declared, artifact, lastModified)
+		return p.storeArtifact(ctx, ecosystem, name, version, filename, pkgPURL, versionPURL, upstreamURL, upstreamHash, declared, artifact, meta)
 	}
 	h.feed = feed
 
@@ -206,7 +216,7 @@ func (p *Proxy) storeWhileServing(ctx context.Context, h *missHandoff, ecosystem
 		// database write. Reading the upstream still stops with ctx, which
 		// ends the copy to storage too.
 		fetched, err := p.storeArtifact(context.WithoutCancel(ctx), ecosystem, name, version, filename, pkgPURL, versionPURL, upstreamURL, upstreamHash, declared,
-			&fetch.Artifact{Body: storeR, Size: artifact.Size, ContentType: artifact.ContentType, ETag: artifact.ETag}, lastModified)
+			&fetch.Artifact{Body: storeR, Size: artifact.Size, ContentType: artifact.ContentType, ETag: artifact.ETag}, meta)
 		// storeArtifact closes storeR; this covers a return before it read
 		// anything, so the copy below never blocks on it.
 		_ = storeR.Close()

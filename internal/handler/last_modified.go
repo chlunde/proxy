@@ -17,24 +17,32 @@ import (
 	"github.com/git-pkgs/registries/fetch"
 )
 
-// fetchDated fetches url with fetchUpstream. For Maven it also returns the
-// upstream Last-Modified, zero if there is none. Only Maven asks:
-// Dependabot's Maven cooldown is its one known reader, and the observed
-// fetch hashes the body with SHA-256 and SHA-512 on the way through. A
-// Last-Modified callback already on ctx (Maven cooldown) still gets the
-// date.
-func (p *Proxy) fetchDated(ctx context.Context, ecosystem, url string, headers http.Header) (*fetch.Artifact, time.Time, error) {
+// upstreamMeta is what upstream's response headers said about the bytes.
+type upstreamMeta struct {
+	// lastModified is the Last-Modified, zero if there is none.
+	lastModified time.Time
+	// sums are the X-Checksum-* digests, if upstream sent them.
+	sums checksums
+}
+
+// fetchMeta fetches url with fetchUpstream. For Maven it also returns what
+// the response headers say about the bytes. Only Maven asks: its clients
+// are the known readers, and the observed fetch hashes the body with
+// SHA-256 and SHA-512 on the way through. An observer already on ctx
+// (Maven cooldown) still sees the headers.
+func (p *Proxy) fetchMeta(ctx context.Context, ecosystem, url string, headers http.Header) (*fetch.Artifact, upstreamMeta, error) {
 	if ecosystem != "maven" {
 		artifact, err := p.fetchUpstream(ctx, url, headers)
-		return artifact, time.Time{}, err
+		return artifact, upstreamMeta{}, err
 	}
-	var date time.Time
-	ctx = WithUpstreamLastModified(ctx, func(t time.Time) { date = upstreamDate(t) })
+	var meta upstreamMeta
+	ctx = WithUpstreamLastModified(ctx, func(t time.Time) { meta.lastModified = upstreamDate(t) })
+	ctx = withUpstreamHeaders(ctx, func(h http.Header) { meta.sums = upstreamChecksums(h) })
 	artifact, err := p.fetchUpstream(ctx, url, headers)
 	if err != nil {
-		return nil, time.Time{}, err
+		return nil, upstreamMeta{}, err
 	}
-	return artifact, date, nil
+	return artifact, meta, nil
 }
 
 // The production fetcher; a wrapper without the observed path would
