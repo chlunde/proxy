@@ -157,6 +157,8 @@ artifacts (
     hit_count      INTEGER DEFAULT 0, -- BIGINT on Postgres
     last_accessed_at DATETIME,
     last_modified  DATETIME,          -- upstream Last-Modified (Maven), sent on serve
+    sha1           TEXT,              -- hex, computed on store (Maven)
+    md5            TEXT,              -- hex, computed on store (Maven)
     created_at     DATETIME,
     updated_at     DATETIME
 )

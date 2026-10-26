@@ -77,7 +77,9 @@ CREATE TABLE IF NOT EXISTS artifacts (
 	source TEXT NOT NULL DEFAULT 'upstream',
 	manifest TEXT,
 	mirrored_at DATETIME,
-	last_modified DATETIME
+	last_modified DATETIME,
+	sha1 TEXT,
+	md5 TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_version_filename ON artifacts(version_purl, filename);
 CREATE INDEX IF NOT EXISTS idx_artifacts_storage_path ON artifacts(storage_path);
@@ -274,7 +276,9 @@ CREATE TABLE IF NOT EXISTS artifacts (
 	source TEXT NOT NULL DEFAULT 'upstream',
 	manifest TEXT,
 	mirrored_at TIMESTAMP,
-	last_modified TIMESTAMP
+	last_modified TIMESTAMP,
+	sha1 TEXT,
+	md5 TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_version_filename ON artifacts(version_purl, filename);
 CREATE INDEX IF NOT EXISTS idx_artifacts_storage_path ON artifacts(storage_path);
@@ -430,7 +434,9 @@ CREATE TABLE IF NOT EXISTS artifacts (
 	source TEXT NOT NULL DEFAULT 'upstream',
 	manifest TEXT,
 	mirrored_at DATETIME,
-	last_modified DATETIME
+	last_modified DATETIME,
+	sha1 TEXT,
+	md5 TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_version_filename ON artifacts(version_purl, filename);
 CREATE INDEX IF NOT EXISTS idx_artifacts_storage_path ON artifacts(storage_path);
@@ -457,7 +463,9 @@ CREATE TABLE IF NOT EXISTS artifacts (
 	source TEXT NOT NULL DEFAULT 'upstream',
 	manifest TEXT,
 	mirrored_at TIMESTAMP,
-	last_modified TIMESTAMP
+	last_modified TIMESTAMP,
+	sha1 TEXT,
+	md5 TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_version_filename ON artifacts(version_purl, filename);
 CREATE INDEX IF NOT EXISTS idx_artifacts_storage_path ON artifacts(storage_path);
@@ -588,6 +596,7 @@ var migrations = []migration{
 	{"025_partial_artifacts_last_used_index", migratePartialArtifactsLastUsedIndex},
 	{"026_add_image_tags", migrateAddImageTags},
 	{"027_add_artifact_last_modified", migrateAddArtifactLastModified},
+	{"028_add_artifact_checksums", migrateAddArtifactChecksums},
 }
 
 // isTableNotFound returns true if the error indicates a missing table.
@@ -1296,6 +1305,25 @@ func migratePartialArtifactsLastUsedIndex(db *DB) error {
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("replacing artifacts last-used index: %w", err)
+	}
+	return nil
+}
+
+// migrateAddArtifactChecksums stores the SHA-1 and MD5 of a Maven file,
+// which clients read from X-Checksum-* headers instead of fetching .sha1
+// files. Existing rows stay NULL until a hit or refetch fills them.
+func migrateAddArtifactChecksums(db *DB) error {
+	for _, col := range []string{"sha1", "md5"} {
+		hasCol, err := db.HasColumn("artifacts", col)
+		if err != nil {
+			return fmt.Errorf("checking column %s: %w", col, err)
+		}
+		if hasCol {
+			continue
+		}
+		if _, err := db.Exec("ALTER TABLE artifacts ADD COLUMN " + col + " TEXT"); err != nil {
+			return fmt.Errorf("adding column %s to artifacts: %w", col, err)
+		}
 	}
 	return nil
 }

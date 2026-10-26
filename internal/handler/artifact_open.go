@@ -29,6 +29,7 @@ type ApprovedArtifact struct {
 
 	ecosystem string
 	checks    integrityChecks
+	sums      checksums
 }
 
 // findStored returns the artifact cached under pkgPURL, versionPURL and
@@ -55,6 +56,7 @@ func (p *Proxy) findStored(pkgPURL, versionPURL, filename string) (*ApprovedArti
 		LastModified: record.LastModified.Time,
 		ecosystem:    record.Ecosystem,
 		checks:       checks,
+		sums:         checksums{sha1: record.SHA1, md5: record.MD5},
 	}, nil
 }
 
@@ -73,7 +75,7 @@ func (p *Proxy) Open(ctx context.Context, a *ApprovedArtifact) (*CacheResult, er
 	if !a.Cached {
 		return p.openFetched(ctx, a)
 	}
-	result := &CacheResult{Artifact: a.Artifact, Cached: true, LastModified: a.LastModified, storagePath: a.StoragePath}
+	result := &CacheResult{Artifact: a.Artifact, Cached: true, LastModified: a.LastModified, storagePath: a.StoragePath, checksums: a.sums}
 
 	if servingHead(ctx) {
 		result.rangeable = readsSeekable(p.Storage)
@@ -136,5 +138,5 @@ func (p *Proxy) openFetched(ctx context.Context, a *ApprovedArtifact) (*CacheRes
 			PURL: a.Artifact.PURL, Filename: a.Artifact.Filename, Path: a.StoragePath, Err: err})
 		return nil, fmt.Errorf("opening cached artifact: %w", err)
 	}
-	return &CacheResult{Reader: reader, Artifact: a.Artifact, LastModified: a.LastModified}, nil
+	return &CacheResult{Reader: reader, Artifact: a.Artifact, LastModified: a.LastModified, checksums: a.sums}, nil
 }
