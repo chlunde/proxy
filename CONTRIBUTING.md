@@ -40,9 +40,6 @@ proxy/
 │   ├── storage/             # Artifact file storage
 │   │   ├── storage.go       # Storage interface
 │   │   └── blob.go          # gocloud.dev/blob backends (file, S3, Azure)
-│   ├── upstream/            # Upstream registry clients
-│   │   ├── fetcher.go       # HTTP artifact fetching
-│   │   └── resolver.go      # Download URL resolution
 │   ├── handler/             # Protocol handlers
 │   │   ├── handler.go       # Base proxy + cache logic
 │   │   ├── npm.go           # npm protocol
@@ -86,12 +83,17 @@ type Storage interface {
 }
 ```
 
-### `internal/upstream`
+### Upstream fetching
 
-Fetches artifacts from upstream registries. Two components:
+Artifacts are fetched with the `fetch` package of
+[git-pkgs/registries](https://github.com/git-pkgs/registries), set up in
+`internal/server/server.go`. Two components:
 
-- `Fetcher` - HTTP client with retries, streams artifacts
-- `Resolver` - Determines download URLs for each ecosystem
+- `fetch.Fetcher` - HTTP client with retries, streams artifacts; wrapped in
+  `fetch.CircuitBreakerFetcher` for client requests (not for `proxy mirror`)
+- `fetch.Resolver` - Determines download URLs for `proxy mirror` and mirror
+  jobs (`internal/server/mirror_resolver.go`). Handlers serving clients
+  build download URLs themselves, usually from upstream metadata.
 
 ### `internal/handler`
 
@@ -114,24 +116,30 @@ Configuration loading from files, environment variables, and flags.
 
 To add support for a new package registry:
 
-1. **Add URL resolution** in `internal/upstream/resolver.go`:
+1. **Fetch through the shared cache** from the handler created in step 2,
+   with a download URL it builds, usually from the upstream's metadata:
 
 ```go
-case "newregistry":
-    url = fmt.Sprintf("https://registry.example.com/%s/%s/download", name, version)
-    filename = fmt.Sprintf("%s-%s.tar.gz", name, version)
+url := fmt.Sprintf("%s/%s/%s/download", h.upstreamURL, name, version)
+filename := fmt.Sprintf("%s-%s.tar.gz", name, version)
+result, err := h.proxy.GetOrFetchArtifactFromURL(r.Context(), "newregistry", name, version, filename, url)
 ```
+
+   `proxy mirror` resolves URLs with `fetch.Resolver` from
+   [git-pkgs/registries](https://github.com/git-pkgs/registries); supporting
+   the new ecosystem there is a change to that repository.
 
 2. **Create handler** in `internal/handler/newregistry.go`:
 
 ```go
 type NewRegistryHandler struct {
-    proxy    *Proxy
-    proxyURL string
+    proxy       *Proxy
+    proxyURL    string
+    upstreamURL string
 }
 
-func NewNewRegistryHandler(proxy *Proxy, proxyURL string) *NewRegistryHandler {
-    return &NewRegistryHandler{proxy: proxy, proxyURL: proxyURL}
+func NewNewRegistryHandler(proxy *Proxy, proxyURL, upstreamURL string) *NewRegistryHandler {
+    return &NewRegistryHandler{proxy: proxy, proxyURL: proxyURL, upstreamURL: upstreamURL}
 }
 
 func (h *NewRegistryHandler) Routes() http.Handler {
@@ -144,7 +152,7 @@ func (h *NewRegistryHandler) Routes() http.Handler {
 3. **Mount handler** in `internal/server/server.go`:
 
 ```go
-newHandler := handler.NewNewRegistryHandler(proxy, s.cfg.BaseURL)
+newHandler := handler.NewNewRegistryHandler(proxy, s.cfg.BaseURL, "https://registry.example.com")
 mux.Handle("/newregistry/", http.StripPrefix("/newregistry", newHandler.Routes()))
 ```
 

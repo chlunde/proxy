@@ -266,20 +266,20 @@ cache/artifacts/
                 └── serde-1.0.193.crate
 ```
 
-### `internal/upstream`
+### Upstream fetching (`git-pkgs/registries/fetch`)
 
-Fetches artifacts from upstream registries.
+Fetches artifacts from upstream registries. The `Fetcher` and `Resolver` live in the `fetch` package of [git-pkgs/registries](https://github.com/git-pkgs/registries); `internal/server/server.go` wires them into the proxy.
 
 **Fetcher:**
 - HTTP client with configurable timeout (5 min default for large artifacts)
 - Exponential backoff retry on 429 (rate limit) and 5xx errors
 - Returns streaming reader (doesn't load into memory)
 - Configurable user-agent
-- Shares an authentication-aware transport with metadata requests so URL-scoped credentials apply consistently
-- Discovers and caches scoped OCI Bearer tokens from registry challenges
+- Shares an authentication-aware transport with metadata requests so URL-scoped credentials apply consistently (the transport is the proxy's own, `internal/httpclient/transport.go`)
+- Discovers and caches scoped OCI Bearer tokens from registry challenges (same transport)
 
 **Resolver:**
-- Determines download URL for a package/version
+- Determines download URL for a package/version, for `proxy mirror` and mirror jobs (`internal/server/mirror_resolver.go`); handlers serving clients build URLs themselves, usually from upstream metadata
 - Handles ecosystem-specific URL patterns:
   - npm: `https://registry.npmjs.org/{name}/-/{shortname}-{version}.tgz`
   - cargo: `https://static.crates.io/crates/{name}/{name}-{version}.crate`
@@ -389,10 +389,9 @@ Configuration loading.
 
 ### Adding a New Registry
 
-1. Add URL resolution in `upstream/resolver.go`
-2. Create handler in `handler/newregistry.go`
-3. Mount in `server/server.go`
-4. Add tests
+1. Create handler in `handler/newregistry.go`; it builds download URLs, usually from upstream metadata, and fetches them with `GetOrFetchArtifactFromURL`
+2. Mount in `server/server.go`
+3. Add tests
 
 ### Adding a New Storage Backend
 
