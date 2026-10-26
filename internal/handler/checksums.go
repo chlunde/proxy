@@ -6,9 +6,13 @@ import (
 	"crypto/sha1"
 	"database/sql"
 	"encoding/hex"
+	"fmt"
 	"hash"
 	"io"
 	"net/http"
+	"strings"
+
+	"github.com/git-pkgs/integrity"
 
 	"github.com/git-pkgs/registries/fetch"
 	"github.com/opencontainers/go-digest"
@@ -46,20 +50,78 @@ func deleteChecksumHeaders(h http.Header) {
 
 // fetchHashed fetches url through fetchUpstream. For a Maven file other
 // than a checksum or signature it also returns digests that hash the body
-// as it is stored. Other ecosystems' clients don't read them, so only Maven
-// pays for the hashing.
+// as it is stored, holding the digests upstream sent with it. Other
+// ecosystems' clients don't read them, so only Maven pays for the hashing.
 func (p *Proxy) fetchHashed(ctx context.Context, ecosystem, filename, url string, headers http.Header) (*fetch.Artifact, *bodyDigests, error) {
-	artifact, err := p.fetchUpstream(ctx, url, headers)
-	if err != nil || ecosystem != "maven" || isMavenChecksumFile(filename) {
+	if ecosystem != "maven" || isMavenChecksumFile(filename) {
+		artifact, err := p.fetchUpstream(ctx, url, headers)
 		return artifact, nil, err
 	}
-	return artifact, newBodyDigests(), nil
+	digests := newBodyDigests()
+	ctx = withUpstreamHeaders(ctx, func(h http.Header) { digests.upstream = upstreamChecksums(h) })
+	artifact, err := p.fetchUpstream(ctx, url, headers)
+	if err != nil {
+		return nil, nil, err
+	}
+	return artifact, digests, nil
 }
 
-// bodyDigests computes the SHA-1 and MD5 of a body read through tee.
+// upstreamChecksums returns the digests a Maven repository sent as
+// X-Checksum-*, such as Maven Central. A value that isn't a hex digest of
+// the right length is left out.
+//
+//	X-Checksum-Sha1: 161ba27964a62f241533807a46b8711b13c1d94b
+func upstreamChecksums(h http.Header) checksums {
+	valid := func(name string, alg integrity.Algorithm) string {
+		v := strings.ToLower(strings.TrimSpace(h.Get(name)))
+		if _, err := integrity.ParseHex(alg, v); err != nil {
+			return ""
+		}
+		return v
+	}
+	return checksums{sha1: valid(headerChecksumSHA1, integrity.SHA1), md5: valid(headerChecksumMD5, integrity.MD5)}
+}
+
+// bodyDigests computes the SHA-1 and MD5 of a body read through tee, and
+// holds the digests upstream sent for it.
 type bodyDigests struct {
-	sha1 hash.Hash
-	md5  hash.Hash
+	sha1     hash.Hash
+	md5      hash.Hash
+	upstream checksums
+}
+
+// sent returns the digests upstream sent, none when d is nil. A streamed
+// miss sends these: its headers go out before the body is hashed.
+func (d *bodyDigests) sent() checksums {
+	if d == nil {
+		return checksums{}
+	}
+	return d.upstream
+}
+
+// declaredSHA1 returns upstream's SHA-1 as an integrity checksum to verify
+// a streamed body against, "" when there is none.
+func (d *bodyDigests) declaredSHA1() string {
+	if d.sent().sha1 == "" {
+		return ""
+	}
+	return "sha1:" + d.upstream.sha1
+}
+
+// mismatch compares the computed digests with those upstream sent, after
+// the body is read.
+func (d *bodyDigests) mismatch() error {
+	if d == nil {
+		return nil
+	}
+	got := d.result()
+	if d.upstream.sha1 != "" && d.upstream.sha1 != got.sha1 {
+		return fmt.Errorf("%w: upstream sent SHA-1 %s, got %s", ErrArtifactDigestMismatch, d.upstream.sha1, got.sha1)
+	}
+	if d.upstream.md5 != "" && d.upstream.md5 != got.md5 {
+		return fmt.Errorf("%w: upstream sent MD5 %s, got %s", ErrArtifactDigestMismatch, d.upstream.md5, got.md5)
+	}
+	return nil
 }
 
 func newBodyDigests() *bodyDigests {

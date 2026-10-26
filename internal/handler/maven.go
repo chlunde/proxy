@@ -272,11 +272,12 @@ func (h *MavenHandler) handleDownload(w http.ResponseWriter, r *http.Request, so
 // computed from the stored bytes when the file is fetched:
 //
 //	miss                      the digests the store computed
+//	streamed miss             the digests upstream sent, checked as sent
 //	hit                       the row's digests
 //	hit, row without digests  none (cached before migration 019)
 //	redirect (direct_serve)   none: a 302 carries no headers
 func (h *MavenHandler) checksumsFor(name, version, cacheFilename string, result *CacheResult) checksums {
-	if !result.Cached {
+	if !result.Cached && result.checksums == (checksums{}) {
 		return h.proxy.recordedChecksums("maven", name, version, cacheFilename, result.Artifact.Digest)
 	}
 	return result.checksums

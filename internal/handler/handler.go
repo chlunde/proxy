@@ -738,6 +738,14 @@ func (p *Proxy) storeArtifact(ctx context.Context, ecosystem, name, version, fil
 		}
 		return artifacts.Artifact{}, "", fmt.Errorf("%w: upstream declared %s, got %s", ErrArtifactDigestMismatch, upstreamHash, hash)
 	}
+	if err := digests.mismatch(); err != nil {
+		p.Logger.Error("fetched artifact doesn't match upstream's checksum",
+			"purl", versionPURL, "filename", filename, "url", upstreamURL, "error", err)
+		if delErr := p.Storage.Delete(ctx, storagePath); delErr != nil {
+			p.Logger.Warn("failed to discard artifact with mismatched checksum", "path", storagePath, "error", delErr)
+		}
+		return artifacts.Artifact{}, "", err
+	}
 	if err := verified(); err != nil {
 		p.Logger.Error("fetched artifact failed integrity check",
 			"purl", versionPURL, "filename", filename, "url", upstreamURL, "error", err)
@@ -2606,6 +2614,14 @@ func WithUpstreamLastModified(ctx context.Context, fn func(time.Time)) context.C
 	return context.WithValue(ctx, upstreamLastModifiedKey{}, fn)
 }
 
+type upstreamHeadersKey struct{}
+
+// withUpstreamHeaders returns a context under which an upstream fetch
+// passes the response headers it observed to fn.
+func withUpstreamHeaders(ctx context.Context, fn func(http.Header)) context.Context {
+	return context.WithValue(ctx, upstreamHeadersKey{}, fn)
+}
+
 // observedFetcher is the part of fetch.Fetcher and its circuit breaker that
 // reports response headers.
 type observedFetcher interface {
@@ -2703,8 +2719,9 @@ func (b *exactSizeBody) Read(p []byte) (int, error) {
 
 func (p *Proxy) fetchUpstreamURL(ctx context.Context, downloadURL string, headers http.Header) (*fetch.Artifact, error) {
 	report, _ := ctx.Value(upstreamLastModifiedKey{}).(func(time.Time))
+	observe, _ := ctx.Value(upstreamHeadersKey{}).(func(http.Header))
 	observer, ok := p.Fetcher.(observedFetcher)
-	if report == nil || !ok {
+	if (report == nil && observe == nil) || !ok {
 		return p.Fetcher.FetchWithHeaders(ctx, downloadURL, headers)
 	}
 	observed, err := observer.FetchObservedWithHeaders(ctx, downloadURL, headers)
@@ -2712,8 +2729,11 @@ func (p *Proxy) fetchUpstreamURL(ctx context.Context, downloadURL string, header
 		return nil, err
 	}
 	if observed.Observation != nil {
-		if t, err := http.ParseTime(observed.Observation.Headers.Get(headerLastModified)); err == nil {
+		if t, err := http.ParseTime(observed.Observation.Headers.Get(headerLastModified)); report != nil && err == nil {
 			report(t)
+		}
+		if observe != nil {
+			observe(observed.Observation.Headers)
 		}
 	}
 	return observed.Artifact, nil

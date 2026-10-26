@@ -155,7 +155,13 @@ var errNoReaderLeft = errors.New("neither storage nor the client is reading the 
 // the response. A storage failure leaves the client's copy running.
 func (p *Proxy) storeWhileServing(ctx context.Context, h *missHandoff, ecosystem, name, version, filename, pkgPURL, versionPURL, upstreamURL, upstreamHash, declared string, artifact *fetch.Artifact, digests *bodyDigests) (artifacts.Artifact, string, error) {
 	hash := strings.ToLower(upstreamHash)
-	checks, err := newIntegrityChecks(hash, declared)
+	// The client's copy is also checked against the SHA-1 upstream sent,
+	// which it is told as X-Checksum-SHA1 before the bytes are hashed.
+	clientDeclared := declared
+	if clientDeclared == "" {
+		clientDeclared = digests.declaredSHA1()
+	}
+	checks, err := newIntegrityChecks(hash, clientDeclared)
 	if err != nil {
 		_ = artifact.Body.Close()
 		return artifacts.Artifact{}, "", err
@@ -163,7 +169,7 @@ func (p *Proxy) storeWhileServing(ctx context.Context, h *missHandoff, ecosystem
 
 	feed := newMissFeed(clientFeedLimit)
 	var client io.ReadCloser = feed
-	if hash != "" || declared != "" {
+	if hash != "" || clientDeclared != "" {
 		if client, err = checks.wrapFailOnMismatch(feed, func(reason string) {
 			p.Logger.Warn("artifact sent on a cache miss failed its integrity check; aborting the response",
 				"purl", versionPURL, "filename", filename, "reason", reason)
@@ -182,6 +188,7 @@ func (p *Proxy) storeWhileServing(ctx context.Context, h *missHandoff, ecosystem
 			// can still be aborted.
 			Size: -1,
 		},
+		checksums: digests.sent(),
 	}
 	if hash != "" {
 		stream.Artifact.Digest = digest.Digest("sha256:" + hash)
