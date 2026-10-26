@@ -368,6 +368,8 @@ type CacheResult struct {
 	// rangeable is set on a HEAD cache hit, which has no Reader, when the
 	// stored object would open as a seekable reader.
 	rangeable bool
+	// checksums are sent as X-Checksum-* headers with the body.
+	checksums checksums
 }
 
 // GetOrFetchArtifact retrieves an artifact from cache or fetches from upstream.
@@ -565,6 +567,7 @@ func (p *Proxy) readStored(ctx context.Context, pkgPURL, versionPURL, filename s
 		Cached:       true,
 		LastModified: artifact.LastModified.Time,
 		storagePath:  artifact.StoragePath,
+		checksums:    checksums{sha1: artifact.SHA1, md5: artifact.MD5},
 	}
 
 	if servingHead(ctx) {
@@ -726,7 +729,8 @@ func (p *Proxy) storeArtifact(ctx context.Context, ecosystem, name, version, fil
 	}
 
 	storeStart := time.Now()
-	size, hash, err := p.Storage.Store(ctx, storagePath, body)
+	digests := digestsFor(ecosystem, filename)
+	size, hash, err := p.Storage.Store(ctx, storagePath, digests.tee(body))
 	_ = artifact.Body.Close()
 	metrics.RecordStorageOperation("write", time.Since(storeStart))
 	if err != nil {
@@ -774,7 +778,8 @@ func (p *Proxy) storeArtifact(ctx context.Context, ecosystem, name, version, fil
 	}
 
 	// Update database
-	if err := p.updateCacheDB(ecosystem, name, pkgPURL, upstreamURL, storagePath, sharedArtifact, declared, lastModified); err != nil {
+	sums := digests.result()
+	if err := p.updateCacheDB(ecosystem, name, pkgPURL, upstreamURL, storagePath, sharedArtifact, declared, lastModified, sums); err != nil {
 		if errors.Is(err, database.ErrLocalArtifactExists) {
 			p.Logger.Info("artifact was pushed while it was fetched; keeping the pushed copy",
 				"purl", versionPURL, "filename", filename)
@@ -786,7 +791,7 @@ func (p *Proxy) storeArtifact(ctx context.Context, ecosystem, name, version, fil
 		if qErr := p.DB.QueuePendingDelete(storagePath); qErr != nil && !p.recordedAt(versionPURL, filename, storagePath) {
 			p.Logger.Warn("failed to queue unrecorded artifact for deletion, deleting it once served",
 				"path", storagePath, "error", qErr)
-			return fetchedArtifact{artifact: sharedArtifact, storagePath: storagePath, lastModified: lastModified}, errUnrecorded
+			return fetchedArtifact{artifact: sharedArtifact, storagePath: storagePath, lastModified: lastModified, sums: sums}, errUnrecorded
 		}
 	} else if mirrorFetch(ctx) {
 		if err := p.DB.MarkArtifactMirrored(versionPURL, filename); err != nil {
@@ -796,7 +801,7 @@ func (p *Proxy) storeArtifact(ctx context.Context, ecosystem, name, version, fil
 
 	// The date goes with these bytes even if the record was not written, so
 	// a response never carries another fetch's date.
-	return fetchedArtifact{artifact: sharedArtifact, storagePath: storagePath, lastModified: lastModified}, nil
+	return fetchedArtifact{artifact: sharedArtifact, storagePath: storagePath, lastModified: lastModified, sums: sums}, nil
 }
 
 // recordedAt reports whether the artifact's record points at storagePath. A
@@ -884,6 +889,7 @@ func (p *Proxy) openStoredArtifact(ctx context.Context, fetched fetchedArtifact)
 		Artifact:     artifact,
 		Cached:       false,
 		LastModified: fetched.lastModified,
+		checksums:    fetched.sums,
 	}, nil
 }
 
@@ -909,7 +915,8 @@ func (p *Proxy) cachedArtifactRecord(pkgPURL, versionPURL, filename, upstreamHas
 	if !artifactHashMatches(record.Artifact.Digest.Encoded(), upstreamHash) {
 		return fetchedArtifact{}, false
 	}
-	return fetchedArtifact{artifact: record.Artifact, storagePath: record.StoragePath, lastModified: record.LastModified.Time}, true
+	return fetchedArtifact{artifact: record.Artifact, storagePath: record.StoragePath, lastModified: record.LastModified.Time,
+		sums: checksums{sha1: record.SHA1, md5: record.MD5}}, true
 }
 
 // errSharedFetchAbandoned is what waiters see if the caller running a shared
@@ -1239,6 +1246,8 @@ type fetchedArtifact struct {
 	storagePath string
 	// lastModified is the Last-Modified upstream sent with these bytes.
 	lastModified time.Time
+	// sums are the digests of these bytes, sent as X-Checksum-*.
+	sums checksums
 }
 
 // runScan generates a signed fetch URL for the just-staged artifact and
@@ -1278,7 +1287,7 @@ func (p *Proxy) runScan(ctx context.Context, ecosystem, name, version, filename,
 	return nil
 }
 
-func (p *Proxy) updateCacheDB(ecosystem, name, pkgPURL, upstreamURL, storagePath string, artifact artifacts.Artifact, declared string, lastModified time.Time) error {
+func (p *Proxy) updateCacheDB(ecosystem, name, pkgPURL, upstreamURL, storagePath string, artifact artifacts.Artifact, declared string, lastModified time.Time, sums checksums) error {
 	now := time.Now()
 
 	// Upsert package
@@ -1309,6 +1318,8 @@ func (p *Proxy) updateCacheDB(ecosystem, name, pkgPURL, upstreamURL, storagePath
 		// Replaced on every fetch, NULL if upstream sent none: the date
 		// belongs to these bytes.
 		LastModified: sql.NullTime{Time: lastModified, Valid: !lastModified.IsZero()},
+		SHA1:         nullString(sums.sha1),
+		MD5:          nullString(sums.md5),
 	}
 	// One transaction, so a push that landed while this was fetched keeps
 	// both its artifact and its version's integrity.
@@ -1367,6 +1378,7 @@ func serveArtifactResponse(w http.ResponseWriter, method string, request *http.R
 	if contentHash != "" {
 		w.Header().Set(headerETag, `"`+contentHash+`"`)
 	}
+	result.checksums.setHeaders(w.Header())
 
 	var seeker io.Seeker
 	if result.Reader != nil {
@@ -1410,6 +1422,7 @@ func serveArtifactRange(w http.ResponseWriter, request *http.Request, result *Ca
 	if !satisfiable {
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", result.Artifact.Size))
 		w.Header().Set(headerContentLength, "0")
+		deleteChecksumHeaders(w.Header())
 		w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
 		return true
 	}
@@ -1420,6 +1433,7 @@ func serveArtifactRange(w http.ResponseWriter, request *http.Request, result *Ca
 		w.Header().Del(headerETag)
 		w.Header().Del(headerLastModified)
 		w.Header().Del("Accept-Ranges")
+		deleteChecksumHeaders(w.Header())
 		http.Error(w, "failed to seek cached artifact", http.StatusInternalServerError)
 		return true
 	}

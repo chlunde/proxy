@@ -28,7 +28,7 @@ func seedCachedArtifact(t *testing.T, proxy *Proxy, store *mockStorage, content 
 		t.Fatalf("seeding storage: %v", err)
 	}
 	artifact := testArtifact(content, staleVersionPURL, staleFilename, "application/gzip")
-	if err := proxy.updateCacheDB("npm", "pkg", stalePkgPURL, staleURL, staleStoragePath, artifact, "", time.Time{}); err != nil {
+	if err := proxy.updateCacheDB("npm", "pkg", stalePkgPURL, staleURL, staleStoragePath, artifact, "", time.Time{}, checksums{}); err != nil {
 		t.Fatalf("seeding cache record: %v", err)
 	}
 }

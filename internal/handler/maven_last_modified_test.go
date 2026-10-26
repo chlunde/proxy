@@ -309,7 +309,7 @@ func TestLastModifiedFollowsServedBytes(t *testing.T) {
 	replica := testArtifact("<project/>", "pkg:maven/org.grails/grails-core@6.0.0", "grails-core-6.0.0.pom", "text/xml")
 	proxy.Storage = openHook{mockStorage: store, before: func() {
 		if err := proxy.updateCacheDB("maven", "org.grails:grails-core", "pkg:maven/org.grails/grails-core",
-			"https://replica.example/b.pom", "maven/other-replica.pom", replica, "", dateB); err != nil {
+			"https://replica.example/b.pom", "maven/other-replica.pom", replica, "", dateB, checksums{}); err != nil {
 			t.Errorf("other replica's commit: %v", err)
 		}
 	}}

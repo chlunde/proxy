@@ -484,7 +484,7 @@ func TestCachedArtifactRecord(t *testing.T) {
 	committed := testArtifact(content, versionPURL, filename, "application/gzip")
 	published := time.Date(2024, 3, 5, 10, 11, 12, 0, time.UTC)
 	if err := proxy.updateCacheDB("npm", "pkg", pkgPURL,
-		"https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz", storagePath, committed, "", published); err != nil {
+		"https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz", storagePath, committed, "", published, checksums{}); err != nil {
 		t.Fatalf("seeding cache record: %v", err)
 	}
 

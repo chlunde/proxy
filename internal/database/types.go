@@ -156,6 +156,9 @@ type Artifact struct {
 	MirroredAt sql.NullTime `db:"mirrored_at" json:"-"`
 	// LastModified is the Last-Modified upstream sent with the stored file.
 	LastModified sql.NullTime `db:"last_modified" json:"last_modified,omitempty"`
+	// SHA1 and MD5 are hex digests of the stored file (Maven only).
+	SHA1 sql.NullString `db:"sha1" json:"sha1,omitempty"`
+	MD5  sql.NullString `db:"md5" json:"md5,omitempty"`
 }
 
 func (a *Artifact) sourceOrUpstream() string {
@@ -178,6 +181,10 @@ type CachedArtifact struct {
 	Integrity   sql.NullString
 	// LastModified is the Last-Modified upstream sent with the stored file.
 	LastModified sql.NullTime
+	// SHA1 and MD5 are hex digests of the stored file, computed when it was
+	// stored; empty for other ecosystems and rows not hashed yet.
+	SHA1 string
+	MD5  string
 }
 
 // MetadataCacheEntry represents a cached metadata blob for offline serving.
