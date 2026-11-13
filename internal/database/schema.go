@@ -1211,7 +1211,7 @@ func migrateAddMetadataLastAccessed(db *DB) error {
 
 // migrateAddArtifactChecksums stores the SHA-1 and MD5 of a Maven file,
 // which clients read from X-Checksum-* headers instead of fetching .sha1
-// files. Existing rows stay NULL until a hit or refetch fills them.
+// files. Existing rows stay NULL until a full GET hit or refetch fills them.
 func migrateAddArtifactChecksums(db *DB) error {
 	for _, col := range []string{"sha1", "md5"} {
 		hasCol, err := db.HasColumn("artifacts", col)

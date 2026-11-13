@@ -5,6 +5,7 @@ import (
 	"crypto/sha1"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"hash"
 	"io"
 	"net/http"
@@ -61,6 +62,10 @@ func digestsFor(ecosystem, filename string) *bodyDigests {
 	if ecosystem != "maven" || isMavenChecksumFile(filename) {
 		return nil
 	}
+	return newBodyDigests()
+}
+
+func newBodyDigests() *bodyDigests {
 	return &bodyDigests{sha1: sha1.New(), md5: md5.New()}
 }
 
@@ -85,6 +90,50 @@ func (d *bodyDigests) result() checksums {
 		return checksums{}
 	}
 	return checksums{sha1: hex.EncodeToString(d.sha1.Sum(nil)), md5: hex.EncodeToString(d.md5.Sum(nil))}
+}
+
+// hashOnRead returns r hashing what is read through it. When r reaches EOF
+// after exactly size bytes, done gets the digests. A seek, for a range,
+// stops the hashing. It fills rows stored before digests were kept.
+func hashOnRead(r io.ReadCloser, size int64, done func(checksums)) io.ReadCloser {
+	h := &hashingReader{ReadCloser: r, digests: newBodyDigests(), left: size, done: done}
+	if s, ok := r.(io.Seeker); ok {
+		return &seekableHashingReader{hashingReader: h, seeker: s}
+	}
+	return h
+}
+
+type hashingReader struct {
+	io.ReadCloser
+	digests *bodyDigests // nil once done or seeked
+	left    int64
+	done    func(checksums)
+}
+
+func (r *hashingReader) Read(p []byte) (int, error) {
+	n, err := r.ReadCloser.Read(p)
+	if r.digests == nil {
+		return n, err
+	}
+	_, _ = r.digests.Write(p[:n])
+	r.left -= int64(n)
+	if errors.Is(err, io.EOF) {
+		if r.left == 0 {
+			r.done(r.digests.result())
+		}
+		r.digests = nil
+	}
+	return n, err
+}
+
+type seekableHashingReader struct {
+	*hashingReader
+	seeker io.Seeker
+}
+
+func (r *seekableHashingReader) Seek(offset int64, whence int) (int64, error) {
+	r.digests = nil
+	return r.seeker.Seek(offset, whence)
 }
 
 // isMavenChecksumFile reports whether filename is a checksum or signature

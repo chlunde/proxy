@@ -549,6 +549,17 @@ func (db *DB) upsertArtifactFrom(exec execer, a *Artifact, previous sql.NullStri
 	return n > 0, nil
 }
 
+// SetArtifactChecksums records the SHA-1 and MD5 of an artifact stored
+// before they were kept. It writes only while the row holds the bytes with
+// contentHash and has none, so a refetch's digests are never overwritten.
+func (db *DB) SetArtifactChecksums(versionPURL, filename, contentHash, sha1, md5 string) error {
+	_, err := db.Exec(db.Rebind(`
+		UPDATE artifacts SET sha1 = ?, md5 = ?
+		WHERE version_purl = ? AND filename = ? AND content_hash = ? AND sha1 IS NULL
+	`), sha1, md5, versionPURL, filename, contentHash)
+	return err
+}
+
 func (db *DB) RecordArtifactHit(versionPURL, filename string) error {
 	now := time.Now()
 	if db.hits != nil {
