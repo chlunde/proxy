@@ -138,15 +138,11 @@ func (h *MavenHandler) publishTime(ctx context.Context, source mavenSource, arti
 // cooldown check is to run after the download. It does so only for those
 // files of a version whose time is not stored yet; for anything else the
 // check runs before. Both files are deployed with the version, and
-// whichever a client fetches first gives its time.
+// whichever a client fetches first gives its time. The time is stored with
+// cooldown off too: servePublishTime sends it on.
 func (h *MavenHandler) cooldownFromDownload(ctx context.Context, source mavenSource, urlPath, version string) (context.Context, bool) {
-	if !h.cooldownEnabled() || strings.HasSuffix(version, mavenSnapshot) {
-		return ctx, false
-	}
-	artifactDir := path.Dir(path.Dir(urlPath))
-	group, artifact, ok := mavenCoordinates(artifactDir)
-	if base := artifact + "-" + version; !ok || !usableMavenVersion(version) ||
-		(path.Base(urlPath) != base+".pom" && path.Base(urlPath) != base+".module") {
+	group, artifact, ok := publishFile(urlPath, version)
+	if !ok {
 		return ctx, false
 	}
 	versionPURL, packagePURL, store := h.mavenTimeKey(source, group, artifact, version)
@@ -161,7 +157,63 @@ func (h *MavenHandler) cooldownFromDownload(ctx context.Context, source mavenSou
 			h.proxy.Logger.Warn("cooldown: could not store maven publish time",
 				"group", group, "artifact", artifact, "version", version, "error", err)
 		}
-	}), true
+	}), h.cooldownEnabled()
+}
+
+// publishFile returns the coordinates of a release's .pom or Gradle
+// .module, the files whose Last-Modified is the version's publish time.
+// ok is false for any other file and for a SNAPSHOT, whose files change.
+func publishFile(urlPath, version string) (group, artifact string, ok bool) {
+	if strings.HasSuffix(version, mavenSnapshot) || !usableMavenVersion(version) {
+		return "", "", false
+	}
+	group, artifact, ok = mavenCoordinates(path.Dir(path.Dir(urlPath)))
+	base := artifact + "-" + version
+	if !ok || (path.Base(urlPath) != base+".pom" && path.Base(urlPath) != base+".module") {
+		return "", "", false
+	}
+	return group, artifact, true
+}
+
+// pomTimeWait bounds the HEAD upstream that backfills a .pom's time, so a
+// hanging upstream doesn't hold a cached file for the HTTP timeout.
+var pomTimeWait = 5 * time.Second
+
+// servePublishTime sets Last-Modified on a release's .pom or .module to the
+// version's publish time. Dependabot's Maven cooldown dates a release by
+// HEAD on its .pom when the directory listing has no dates, and treats a
+// missing date as old enough.
+//
+// A time the versions table lacks, for a .pom cached before it was kept, is
+// read from upstream on a HEAD only, as Maven cooldown reads it: build
+// tools GET, and a cache hit never waits on upstream for them. Without a
+// time no Last-Modified is sent, never the fetch time.
+func (h *MavenHandler) servePublishTime(w http.ResponseWriter, r *http.Request, source mavenSource, urlPath, version string) {
+	group, artifact, ok := publishFile(urlPath, version)
+	if !ok {
+		return
+	}
+	versionPURL, _, ok := h.mavenTimeKey(source, group, artifact, version)
+	if !ok {
+		return
+	}
+	var published time.Time
+	if r.Method == http.MethodHead {
+		ctx, cancel := context.WithTimeout(r.Context(), pomTimeWait)
+		defer cancel()
+		var err error
+		if published, err = h.publishTime(ctx, source, path.Dir(path.Dir(urlPath)), version); err != nil {
+			h.proxy.Logger.Debug("could not read maven publish time; sending no Last-Modified",
+				"group", group, "artifact", artifact, "version", version, "error", err)
+		}
+	} else if ver, err := h.proxy.DB.GetVersionByPURL(versionPURL); err == nil && ver != nil && ver.PublishedAt.Valid {
+		published = ver.PublishedAt.Time
+	}
+	if published.IsZero() {
+		return
+	}
+	// Never later than the response (RFC 9110 8.8.2.1).
+	w.Header().Set(headerLastModified, minTime(published, time.Now()).UTC().Format(http.TimeFormat))
 }
 
 // pomLastModified sends a HEAD request for a .pom and returns its
