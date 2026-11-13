@@ -154,3 +154,29 @@ func TestArtifactChecksumsMigration(t *testing.T) {
 		}
 	})
 }
+
+// SetArtifactChecksums fills a row without digests, but only for the bytes
+// they were computed from, and never replaces digests a fetch recorded.
+func TestSetArtifactChecksums(t *testing.T) {
+	runWithBothDatabases(t, func(t *testing.T, db *DB) {
+		upsertChecksumArtifact(t, db, "maven/a", "", "")
+		if err := db.SetArtifactChecksums(checksumVersionPURL, checksumFilename, otherContentHash, "bad", "bad"); err != nil {
+			t.Fatal(err)
+		}
+		if sha1, md5 := cachedChecksums(t, db); sha1 != "" || md5 != "" {
+			t.Errorf("other bytes: %q, %q; want none", sha1, md5)
+		}
+		if err := db.SetArtifactChecksums(checksumVersionPURL, checksumFilename, testContentHash, checksumSHA1, checksumMD5); err != nil {
+			t.Fatal(err)
+		}
+		if sha1, md5 := cachedChecksums(t, db); sha1 != checksumSHA1 || md5 != checksumMD5 {
+			t.Errorf("same bytes: %q, %q", sha1, md5)
+		}
+		if err := db.SetArtifactChecksums(checksumVersionPURL, checksumFilename, testContentHash, "bad", "bad"); err != nil {
+			t.Fatal(err)
+		}
+		if sha1, _ := cachedChecksums(t, db); sha1 != checksumSHA1 {
+			t.Errorf("recorded digests replaced with %q", sha1)
+		}
+	})
+}

@@ -311,20 +311,40 @@ func TestMavenChecksumNamedRepository(t *testing.T) {
 	}
 }
 
-// A row without digests, cached before migration 019, is served as before:
-// no headers, and the file is not read again to hash it.
-func TestMavenChecksumOldRowSendsNone(t *testing.T) {
+// A row without digests, cached before the migration, gets them on its
+// first full GET hit: that response is hashed as it is served, without
+// another read of storage, and later responses carry the digests.
+func TestMavenChecksumOldRowFilledOnHit(t *testing.T) {
 	h, _, proxy, store := newChecksumHandler(t, map[string]string{mavenJarPath: checksumTestJar})
 	requestMaven(h, http.MethodGet, mavenJarPath)
 	clearRowChecksums(t, proxy)
+
 	before := store.openCount()
 	w := requestMaven(h, http.MethodGet, mavenJarPath)
 	if w.Code != http.StatusOK || w.Body.String() != checksumTestJar {
 		t.Fatalf("hit: status = %d, body = %q", w.Code, w.Body)
 	}
-	assertChecksumHeaders(t, "hit", w, "", "")
+	assertChecksumHeaders(t, "first hit", w, "", "")
 	if n := store.openCount() - before; n != 1 {
 		t.Errorf("storage opens on hit = %d, want 1", n)
+	}
+	if sha1, md5 := rowChecksums(t, proxy, "grails-core-6.0.0.jar"); sha1.String != checksumTestSHA1 || md5.String != checksumTestMD5 {
+		t.Errorf("row after first hit = %v, %v", sha1, md5)
+	}
+	assertChecksumHeaders(t, "second hit", requestMaven(h, http.MethodGet, mavenJarPath), checksumTestSHA1, checksumTestMD5)
+}
+
+// A range hit reads part of the file, so it records no digests.
+func TestMavenChecksumOldRowRangeNotFilled(t *testing.T) {
+	h, _, proxy, _ := newChecksumHandler(t, map[string]string{mavenJarPath: checksumTestJar})
+	requestMaven(h, http.MethodGet, mavenJarPath)
+	clearRowChecksums(t, proxy)
+
+	if w := requestMaven(h, http.MethodGet, mavenJarPath, "Range", "bytes=0-2"); w.Code != http.StatusPartialContent {
+		t.Fatalf("range: status = %d", w.Code)
+	}
+	if sha1, md5 := rowChecksums(t, proxy, "grails-core-6.0.0.jar"); sha1.Valid || md5.Valid {
+		t.Errorf("row after range = %v, %v; want NULL", sha1, md5)
 	}
 }
 

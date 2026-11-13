@@ -558,6 +558,15 @@ func (p *Proxy) readStored(ctx context.Context, pkgPURL, versionPURL, filename s
 	if err != nil || result == nil {
 		return nil, err
 	}
+	if result.Reader != nil && a.sums.sha1 == "" && digestsFor(a.ecosystem, filename) != nil {
+		// Stored before digests were kept: record them from this read.
+		hash := a.Artifact.Digest.Encoded()
+		result.Reader = hashOnRead(result.Reader, a.Artifact.Size, func(sums checksums) {
+			if err := p.DB.SetArtifactChecksums(versionPURL, filename, hash, sums.sha1, sums.md5); err != nil {
+				p.Logger.Warn("failed to record artifact checksums", "purl", versionPURL, "filename", filename, "error", err)
+			}
+		})
+	}
 	p.recordCacheHit(ctx, a.ecosystem, versionPURL, filename)
 	return result, nil
 }
