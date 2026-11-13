@@ -297,6 +297,7 @@ func (h *MavenHandler) handleDownload(w http.ResponseWriter, r *http.Request, so
 		return
 	}
 
+	h.servePublishTime(w, r, source, urlPath, version)
 	ServeArtifactRequest(w, r, result)
 }
 
