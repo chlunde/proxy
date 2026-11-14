@@ -1,0 +1,15 @@
+# Proxy under test plus a local Maven upstream without Last-Modified
+# (nolm_server.py: "slowhead" hangs on HEAD, "headfail" gives 503).
+services:
+  proxy:
+    image: ${IMAGE:-proxy-e2e:b}
+    command: ["serve", "-config", "/etc/proxy.yaml"]
+    ports: ["18090:8080"]
+    environment: [PROXY_BASE_URL=http://host.docker.internal:18090]
+    volumes: [./config.yaml:/etc/proxy.yaml:ro, ./logs:/logs, data:/data]
+  upstream:
+    image: python:3.12-slim
+    command: ["python", "/s.py", "8000", "/logs/upstream.txt"]
+    volumes: [./nolm_server.py:/s.py:ro, ./logs:/logs]
+volumes:
+  data:
