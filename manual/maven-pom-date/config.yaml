@@ -1,0 +1,13 @@
+listen: ":8080"
+storage:
+  path: /data/artifacts
+database:
+  path: /data/proxy.db
+access_log:
+  path: /logs/access.jsonl
+upstream:
+  allow_private_hosts: ["upstream"]
+  maven: "https://repo1.maven.org/maven2"
+  maven_repositories:
+    gcs: "https://maven-central.storage-download.googleapis.com/maven2"
+    nolm: "http://upstream:8000"
