@@ -10,6 +10,7 @@ import (
 
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/ecr"
+	"github.com/aws/aws-sdk-go-v2/service/ecrpublic"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -18,6 +19,12 @@ const (
 	ecrTokenSkew            = 5 * time.Minute
 	ecrTokenFailureBackoff  = 30 * time.Second
 	ecrDefaultTokenLifetime = 12 * time.Hour
+
+	// ecrPublicKey caches the ECR Public token apart from private ECR ones.
+	// It is not an AWS region, so it cannot collide with one.
+	ecrPublicKey = "public"
+	// ecrPublicRegion is the only region with the ECR Public API.
+	ecrPublicRegion = "us-east-1"
 )
 
 // ecrTokens caches AWS ECR authorization tokens per region and refreshes them
@@ -162,7 +169,30 @@ func ecrRegion(rawURL string) string {
 	return ""
 }
 
+// ecrPublic reports whether rawURL is on ECR Public, whose registry and
+// token endpoint (public.ecr.aws/token/) share one host.
+func ecrPublic(rawURL string) bool {
+	parsed, err := url.Parse(rawURL)
+	return err == nil && strings.EqualFold(parsed.Hostname(), "public.ecr.aws")
+}
+
+// publicHeader returns the ECR Public header for rawURL. The registry
+// answers 400 DENIED to Basic on /v2/ but takes the token as Bearer. Its
+// /token/ endpoint takes Basic and returns the same value, so a 401
+// challenge ends with the same Bearer.
+func (e *ecrTokens) publicHeader(rawURL string) (name, value string) {
+	name, value = e.header(ecrPublicKey)
+	parsed, err := url.Parse(rawURL)
+	if value == "" || err != nil || strings.HasPrefix(parsed.Path, "/token/") {
+		return name, value
+	}
+	return name, "Bearer " + strings.TrimPrefix(value, "Basic ")
+}
+
 func fetchECRToken(ctx context.Context, region string) (string, time.Time, error) {
+	if region == ecrPublicKey {
+		return fetchECRPublicToken(ctx)
+	}
 	var opts []func(*awsconfig.LoadOptions) error
 	if region != "" {
 		opts = append(opts, awsconfig.WithRegion(region))
@@ -181,6 +211,30 @@ func fetchECRToken(ctx context.Context, region string) (string, time.Time, error
 	}
 
 	data := out.AuthorizationData[0]
+	expiresAt := time.Now().Add(ecrDefaultTokenLifetime)
+	if data.ExpiresAt != nil {
+		expiresAt = *data.ExpiresAt
+	}
+	return *data.AuthorizationToken, expiresAt, nil
+}
+
+// fetchECRPublicToken gets a token from the ecr-public API. Pulls work
+// anonymously too, but an authenticated token raises the pull rate limit.
+func fetchECRPublicToken(ctx context.Context) (string, time.Time, error) {
+	cfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(ecrPublicRegion))
+	if err != nil {
+		return "", time.Time{}, err
+	}
+
+	out, err := ecrpublic.NewFromConfig(cfg).GetAuthorizationToken(ctx, &ecrpublic.GetAuthorizationTokenInput{})
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	data := out.AuthorizationData
+	if data == nil || data.AuthorizationToken == nil {
+		return "", time.Time{}, nil
+	}
+
 	expiresAt := time.Now().Add(ecrDefaultTokenLifetime)
 	if data.ExpiresAt != nil {
 		expiresAt = *data.ExpiresAt

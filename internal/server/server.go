@@ -956,6 +956,9 @@ func (s *Server) authForURL(url string) (headerName, headerValue string) {
 		return "", ""
 	}
 	if strings.EqualFold(auth.Type, "ecr") {
+		if ecrPublic(url) {
+			return s.ecr.publicHeader(url)
+		}
 		region := auth.Region
 		if region == "" {
 			region = ecrRegion(url)

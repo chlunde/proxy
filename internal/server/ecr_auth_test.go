@@ -5,8 +5,10 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -326,5 +328,141 @@ func TestAuthForURLRoutesECRType(t *testing.T) {
 	name, value = s.authForURL("https://registry-1.docker.io/v2/")
 	if name != "" || value != "" {
 		t.Fatalf("unmatched authForURL() = %q, %q; want empty", name, value)
+	}
+}
+
+func TestAuthForURLUsesECRPublicToken(t *testing.T) {
+	e := testECRTokens()
+	var mu sync.Mutex
+	var keys []string
+	e.getToken = func(_ context.Context, key string) (string, time.Time, error) {
+		mu.Lock()
+		keys = append(keys, key)
+		mu.Unlock()
+		if key == ecrPublicKey {
+			return "cHVibGlj", time.Now().Add(time.Hour), nil
+		}
+		return "cHJpdmF0ZQ==", time.Now().Add(time.Hour), nil
+	}
+
+	s := &Server{
+		ecr: e,
+		cfg: &config.Config{Upstream: config.UpstreamConfig{
+			Auth: map[string]config.AuthConfig{
+				// region is ignored: ECR Public tokens only come from us-east-1.
+				"https://public.ecr.aws":                               {Type: "ecr", Region: "eu-west-1"},
+				"https://123456789012.dkr.ecr.us-east-1.amazonaws.com": {Type: "ecr"},
+			},
+		}},
+	}
+
+	// The registry takes the token as Bearer; /token/ takes it as Basic.
+	for u, want := range map[string]string{
+		"https://public.ecr.aws/v2/docker/library/alpine/manifests/3":               "Bearer cHVibGlj",
+		"https://public.ecr.aws/token/?scope=repository:docker/library/alpine:pull": "Basic cHVibGlj",
+	} {
+		if name, value := s.authForURL(u); name != "Authorization" || value != want {
+			t.Errorf("authForURL(%q) = %q, %q; want %q", u, name, value, want)
+		}
+	}
+
+	// A private us-east-1 registry keeps its own token.
+	name, value := s.authForURL("https://123456789012.dkr.ecr.us-east-1.amazonaws.com/v2/repo/manifests/1")
+	if name != "Authorization" || value != "Basic cHJpdmF0ZQ==" {
+		t.Errorf("private authForURL() = %q, %q", name, value)
+	}
+	if len(keys) != 2 || keys[0] != ecrPublicKey || keys[1] != "us-east-1" {
+		t.Errorf("getToken keys = %q, want [%s us-east-1]", keys, ecrPublicKey)
+	}
+}
+
+func TestECRPublic(t *testing.T) {
+	tests := map[string]bool{
+		"https://public.ecr.aws/v2/repo":                               true,
+		"https://PUBLIC.ECR.AWS/token/":                                true,
+		"https://public.ecr.aws.example/v2/repo":                       false,
+		"https://x.public.ecr.aws/v2/repo":                             false,
+		"https://123456789012.dkr.ecr.us-east-1.amazonaws.com/v2/repo": false,
+		"://invalid": false,
+	}
+	for u, want := range tests {
+		if got := ecrPublic(u); got != want {
+			t.Errorf("ecrPublic(%q) = %v, want %v", u, got, want)
+		}
+	}
+}
+
+// fakeECRPublic answers like public.ecr.aws: 400 DENIED to Basic on /v2/,
+// and /token/ echoes the Basic credential back as the token. With
+// challenge set, the first /v2/ request gets a 401 to test that path too.
+func fakeECRPublic(t *testing.T, challenge bool) (*httptest.Server, *atomic.Int32) {
+	t.Helper()
+	var tokenCalls atomic.Int32
+	var challenged atomic.Bool
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		if strings.HasPrefix(r.URL.Path, "/token/") {
+			tokenCalls.Add(1)
+			if auth != "Basic cHVibGlj" {
+				http.Error(w, "denied", http.StatusForbidden)
+				return
+			}
+			_, _ = io.WriteString(w, `{"token":"cHVibGlj"}`)
+			return
+		}
+		if challenge && !challenged.Swap(true) {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="https://public.ecr.aws/token/",service="public.ecr.aws",scope="aws"`)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if auth != "Bearer cHVibGlj" {
+			http.Error(w, `{"errors":[{"code":"DENIED"}]}`, http.StatusBadRequest)
+			return
+		}
+		_, _ = io.WriteString(w, "{}")
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &tokenCalls
+}
+
+func TestECRPublicPull(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		challenge  bool
+		tokenCalls int32
+	}{
+		{"direct", false, 0},
+		{"after 401", true, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, tokenCalls := fakeECRPublic(t, tc.challenge)
+			e := testECRTokens()
+			e.getToken = func(context.Context, string) (string, time.Time, error) {
+				return "cHVibGlj", time.Now().Add(time.Hour), nil
+			}
+			s := &Server{ecr: e, cfg: &config.Config{Upstream: config.UpstreamConfig{
+				Auth: map[string]config.AuthConfig{"https://public.ecr.aws": {Type: "ecr"}},
+			}}}
+
+			// Send public.ecr.aws to the fake server.
+			base := srv.Client().Transport.(*http.Transport).Clone()
+			base.TLSClientConfig.ServerName = "example.com"
+			base.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, network, srv.Listener.Addr().String())
+			}
+			client := &http.Client{Transport: httpclient.NewTransport(base, s.authForURL)}
+
+			resp, err := client.Get("https://public.ecr.aws/v2/docker/library/redis/manifests/7-alpine")
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Errorf("status = %d, want 200", resp.StatusCode)
+			}
+			if got := tokenCalls.Load(); got != tc.tokenCalls {
+				t.Errorf("/token/ calls = %d, want %d", got, tc.tokenCalls)
+			}
+		})
 	}
 }

@@ -1306,6 +1306,17 @@ upstream:
 
 AWS credentials are resolved by the SDK's default chain, which covers EKS IAM Roles for Service Accounts (IRSA), EC2/ECS instance profiles, `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` environment variables, and `~/.aws/credentials`. The IAM identity needs the `ecr:GetAuthorizationToken` action plus the usual `ecr:BatchGetImage` / `ecr:GetDownloadUrlForLayer` permissions on the target repositories. The region is inferred from private ECR IPv4, dual-stack, and FIPS hostnames. For other endpoint formats, set `region` explicitly or configure a default region for the SDK.
 
+ECR Public (`public.ecr.aws`) takes the same `type: ecr`. Its token comes from `ecr-public:GetAuthorizationToken`, which also needs `sts:GetServiceBearerToken`, and is always fetched in `us-east-1`, so `region` is ignored. Pulls from ECR Public work without credentials too; an authenticated token raises the pull rate limit. If no token can be fetched, the proxy pulls anonymously.
+
+```yaml
+upstream:
+  oci:
+    ecr-public: "https://public.ecr.aws"
+  auth:
+    "https://public.ecr.aws":
+      type: ecr
+```
+
 ### URL Matching
 
 Auth keys must be absolute URLs. Matching compares the scheme, host, effective port, and path-segment prefix, preventing credentials for `registry.example.com` from being sent to a lookalike host such as `registry.example.com.evil.test`. The longest matching scope wins, so you can configure different credentials for different paths:
