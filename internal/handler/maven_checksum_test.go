@@ -311,6 +311,35 @@ func TestMavenChecksumNamedRepository(t *testing.T) {
 	}
 }
 
+// Two named repositories with the same coordinates but different bytes
+// each send the digests of their own file, cold and hot.
+func TestMavenChecksumTwoRepositories(t *testing.T) {
+	const otherJar = "other jar bytes"
+	upstream := &checksumUpstream{files: map[string]string{
+		"/a" + mavenJarPath: checksumTestJar,
+		"/b" + mavenJarPath: otherJar,
+	}, requests: map[string]int{}}
+	srv := httptest.NewServer(upstream)
+	t.Cleanup(srv.Close)
+	proxy, _, store, _ := setupTestProxy(t)
+	store.seekable = true
+	fetcher := fetch.NewFetcher(fetch.WithHTTPClient(srv.Client()), fetch.WithMaxRetries(0))
+	proxy.Fetcher = fetcher
+	t.Cleanup(func() { _ = fetcher.Close() })
+	h := NewMavenHandler(proxy, "http://localhost", srv.URL, srv.URL+"/portal").
+		WithRepositories(map[string]string{"a": srv.URL + "/a", "b": srv.URL + "/b"}).Routes()
+
+	sum := sha1Hex(otherJar)
+	for _, step := range []string{"cold", "hot"} {
+		if w := requestMaven(h, http.MethodGet, "/a"+mavenJarPath); w.Header().Get("X-Checksum-SHA1") != checksumTestSHA1 {
+			t.Errorf("%s a: X-Checksum-SHA1 = %q, want %q", step, w.Header().Get("X-Checksum-SHA1"), checksumTestSHA1)
+		}
+		if w := requestMaven(h, http.MethodGet, "/b"+mavenJarPath); w.Header().Get("X-Checksum-SHA1") != sum {
+			t.Errorf("%s b: X-Checksum-SHA1 = %q, want %q", step, w.Header().Get("X-Checksum-SHA1"), sum)
+		}
+	}
+}
+
 // A row without digests, cached before the migration, gets them on its
 // first full GET hit: that response is hashed as it is served, without
 // another read of storage, and later responses carry the digests.
